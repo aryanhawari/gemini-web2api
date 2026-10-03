@@ -441,7 +441,7 @@ def make_handler(app):
                 return
 
             if wants_stream:
-                gen = app.gemini.stream_generate(prompt, file_refs, model_info)
+                gen = app.gemini.stream_events(prompt, file_refs, model_info)
                 try:
                     first = next(gen)
                 except StopIteration:
@@ -450,24 +450,39 @@ def make_handler(app):
                 self._sse(_chat_chunk(cid, created, model_info.name,
                                       {"role": "assistant", "content": ""}))
                 pieces = []
+
+                def _emit(event):
+                    kind, delta = event
+                    if kind == "thought":
+                        self._sse(_chat_chunk(cid, created, model_info.name,
+                                              {"reasoning_content": delta}))
+                    else:
+                        pieces.append(delta)
+                        self._sse(_chat_chunk(cid, created, model_info.name,
+                                              {"content": delta}))
+
                 if first is not None:
-                    pieces.append(first)
-                    self._sse(_chat_chunk(cid, created, model_info.name, {"content": first}))
-                for delta in gen:
-                    pieces.append(delta)
-                    self._sse(_chat_chunk(cid, created, model_info.name, {"content": delta}))
+                    _emit(first)
+                for event in gen:
+                    _emit(event)
                 text = "".join(pieces)
                 final = _chat_chunk(cid, created, model_info.name, {}, "stop")
                 final["usage"] = _usage(prompt, text)
                 self._sse(final)
                 self._sse("[DONE]")
             else:
-                text = app.gemini.generate(prompt, file_refs, model_info)
+                reasoning = []
+                pieces = []
+                for kind, delta in app.gemini.stream_events(prompt, file_refs, model_info):
+                    (reasoning if kind == "thought" else pieces).append(delta)
+                text = "".join(pieces)
+                message = {"role": "assistant", "content": text}
+                if reasoning:
+                    message["reasoning_content"] = "".join(reasoning)
                 self._send_json({
                     "id": cid, "object": "chat.completion", "created": created,
                     "model": model_info.name,
-                    "choices": [{"index": 0,
-                                 "message": {"role": "assistant", "content": text},
+                    "choices": [{"index": 0, "message": message,
                                  "finish_reason": "stop"}],
                     "usage": _usage(prompt, text),
                 })

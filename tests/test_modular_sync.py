@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gemini_web2api.config import Config, CookieStore, load_config
 from gemini_web2api.gemini import (GeminiError, RateLimitedError, RetryableError,
                                    build_inner, clean_text, extract_build_label,
-                                   extract_line_text, iter_deltas, parse_response)
+                                   extract_line_parts, extract_line_text, iter_deltas,
+                                   iter_events, parse_response)
 from gemini_web2api.models import DEFAULT_MODEL, ModelInfo, resolve_model
 from gemini_web2api.multimodal import detect_image_mime
 from gemini_web2api.server import App, make_handler
@@ -38,18 +39,35 @@ class FakeGemini:
         self.text = text
         self.calls = []
 
-    def generate(self, prompt, file_refs=None, model_info=None):
+    def _record(self, prompt, file_refs, model_info):
         self.calls.append({"prompt": prompt, "file_refs": list(file_refs or []),
                            "model": model_info.name if model_info else None,
                            "think": model_info.think if model_info else None})
+
+    def generate(self, prompt, file_refs=None, model_info=None):
+        self._record(prompt, file_refs, model_info)
         return self.text
 
-    def stream_generate(self, prompt, file_refs=None, model_info=None):
-        self.calls.append({"prompt": prompt, "file_refs": list(file_refs or []),
-                           "model": model_info.name if model_info else None,
-                           "think": model_info.think if model_info else None})
+    def stream_events(self, prompt, file_refs=None, model_info=None):
+        self._record(prompt, file_refs, model_info)
         for i in range(0, len(self.text), 5):
-            yield self.text[i:i + 5]
+            yield ("text", self.text[i:i + 5])
+
+    def stream_generate(self, prompt, file_refs=None, model_info=None):
+        for kind, delta in self.stream_events(prompt, file_refs, model_info):
+            if kind == "text":
+                yield delta
+
+
+class ThoughtFakeGemini(FakeGemini):
+    """FakeGemini that also streams a thinking trace before the answer."""
+
+    def stream_events(self, prompt, file_refs=None, model_info=None):
+        self._record(prompt, file_refs, model_info)
+        yield ("thought", "Pondering the question")
+        yield ("thought", " in depth")
+        for i in range(0, len(self.text), 5):
+            yield ("text", self.text[i:i + 5])
 
 
 TOOL_TEXT = 'Let me check.\n```tool_call\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n```'
@@ -191,6 +209,18 @@ def frame_line(text, pad=30, shape="current"):
     return json.dumps([frame])
 
 
+def thought_frame_line(thought, answer=None):
+    """A frame carrying a thinking trace at candidate[37] (+ optional answer)."""
+    inner = [None] * 20
+    candidate = ["rc", [answer or ""]]
+    candidate += [None] * 35  # pad up to index 37
+    candidate.append([["**Thinking**\n\n" + thought],
+                      [None, None, None, None, None, [thought]]])
+    inner[4] = [candidate]
+    frame = ["wrb.fr", None, json.dumps(inner), None] + [None] * 5
+    return json.dumps([frame])
+
+
 class ResponseParseTest(unittest.TestCase):
     def test_parse_response(self):
         body = ")]}'\n" + frame_line("Hello world") + "\n" + json.dumps([["di", 42]]) + "\n"
@@ -222,6 +252,33 @@ class ResponseParseTest(unittest.TestCase):
         lines = [frame_line("Hello", pad=5), frame_line("Goodbye", pad=5)]
         with self.assertRaises(RetryableError):
             list(iter_deltas(lines))
+
+    def test_extract_line_parts_without_thought(self):
+        text, thought = extract_line_parts(frame_line("Hello"))
+        self.assertEqual(text, "Hello")
+        self.assertEqual(thought, "")
+
+    def test_iter_events_thought_then_text(self):
+        lines = [thought_frame_line("step one"),
+                 thought_frame_line("step one step two", "Answer here")]
+        events = list(iter_events(lines))
+        self.assertEqual([kind for kind, _ in events],
+                         ["thought", "thought", "text"])
+        self.assertEqual(events[0][1], "**Thinking**\n\nstep one")
+        self.assertEqual(events[1][1], " step two")
+        self.assertEqual(events[2][1], "Answer here")
+
+    def test_iter_events_thought_shrink_is_skipped(self):
+        lines = [thought_frame_line("long thought here"),
+                 thought_frame_line("short", "Answer")]
+        events = list(iter_events(lines))
+        thoughts = [d for kind, d in events if kind == "thought"]
+        self.assertEqual(len(thoughts), 1)  # shrink emits nothing new
+
+    def test_iter_deltas_ignores_thoughts(self):
+        lines = [thought_frame_line("thinking"),
+                 thought_frame_line("thinking", "Answer")]
+        self.assertEqual(list(iter_deltas(lines)), ["Answer"])
 
     def test_clean_text(self):
         dirty = "```python?code_reference&code_event_index=7\nprint(1)\n``` see http://googleusercontent.com/card_content/2"
@@ -505,6 +562,43 @@ class ServerEndpointsTest(unittest.TestCase):
         finishes = [c["choices"][0]["finish_reason"] for c in chunks[1:] if c.get("choices")]
         self.assertEqual(finishes[-1], "stop")
         self.assertIn("usage", chunks[-1])  # final chunk carries usage
+
+    def test_chat_stream_reasoning_content(self):
+        server = make_server(make_app(ThoughtFakeGemini("Final answer.")))
+        try:
+            status, body = request(server.server_address[1], "POST",
+                                   "/v1/chat/completions", {
+                                       "model": "gemini-3.6-flash", "stream": True,
+                                       "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(status, 200)
+            chunks = [json.loads(d) for _, d in parse_sse(body) if d != "[DONE]"]
+            deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
+            self.assertEqual(deltas[0].get("role"), "assistant")
+            self.assertEqual("".join(d.get("reasoning_content", "") for d in deltas),
+                             "Pondering the question in depth")
+            self.assertEqual("".join(d.get("content", "") for d in deltas),
+                             "Final answer.")
+            first_thought = next(i for i, d in enumerate(deltas)
+                                 if d.get("reasoning_content"))
+            first_content = next(i for i, d in enumerate(deltas) if d.get("content"))
+            self.assertLess(first_thought, first_content)
+        finally:
+            server.shutdown()
+
+    def test_chat_non_stream_reasoning_content(self):
+        server = make_server(make_app(ThoughtFakeGemini("Final answer.")))
+        try:
+            status, body = request(server.server_address[1], "POST",
+                                   "/v1/chat/completions", {
+                                       "model": "gemini-3.6-flash",
+                                       "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(status, 200)
+            message = json.loads(body)["choices"][0]["message"]
+            self.assertEqual(message["content"], "Final answer.")
+            self.assertEqual(message["reasoning_content"],
+                             "Pondering the question in depth")
+        finally:
+            server.shutdown()
 
     def test_responses_non_stream(self):
         status, body = request(self.port, "POST", "/v1/responses", {

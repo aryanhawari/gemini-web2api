@@ -192,25 +192,47 @@ def _candidate_text(candidate):
     return "".join(texts)
 
 
-def extract_line_text(raw_line, min_line_len=0):
-    """Returns the longest candidate text found in one response line ('' if none).
+def _thought_text(candidate):
+    """Extracts the thinking-trace text from one candidate ('' if none).
+
+    Thoughts live at candidate[37] (2026 shape) as the same text duplicated
+    at several depths (markdown + plain copies). Taking the longest string in
+    the subtree is robust against minor shape drift.
+    """
+    if not isinstance(candidate, list) or len(candidate) <= 37:
+        return ""
+    best = ""
+    stack = [candidate[37]]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if len(node) > len(best):
+                best = node
+        elif isinstance(node, list):
+            stack.extend(node)
+    return best
+
+
+def extract_line_parts(raw_line, min_line_len=0):
+    """Returns (answer_text, thought_text) found in one response line.
 
     Gemini sends progressively longer full texts per event, so per line the
-    longest candidate is the current answer.
+    longest candidate is the current answer; thoughts behave the same way.
     """
     line = raw_line.strip()
     if not line or line == PREFIX_MARK:
-        return ""
+        return "", ""
     if line.startswith(PREFIX_MARK):
         line = line[len(PREFIX_MARK):].lstrip()
     try:
         data = json.loads(line)
     except ValueError:
-        return ""
+        return "", ""
     _check_error_frames(data)
     if min_line_len and len(line) < min_line_len:
-        return ""
-    best = ""
+        return "", ""
+    best_text = ""
+    best_thought = ""
     for frame in _iter_frames(data):
         if not (isinstance(frame, list) and len(frame) >= 3 and frame[0] == "wrb.fr"):
             continue
@@ -221,9 +243,17 @@ def extract_line_text(raw_line, min_line_len=0):
             continue
         for candidate in inner[4] or []:
             text = _candidate_text(candidate)
-            if len(text) > len(best):
-                best = text
-    return best
+            if len(text) > len(best_text):
+                best_text = text
+            thought = _thought_text(candidate)
+            if len(thought) > len(best_thought):
+                best_thought = thought
+    return best_text, best_thought
+
+
+def extract_line_text(raw_line, min_line_len=0):
+    """Returns the longest candidate text found in one response line ('' if none)."""
+    return extract_line_parts(raw_line, min_line_len)[0]
 
 
 def parse_response(body):
@@ -238,22 +268,43 @@ def parse_response(body):
     return best
 
 
-def iter_deltas(lines):
-    """Converts an iterable of raw response lines into content deltas.
+def iter_events(lines):
+    """Converts raw response lines into ('thought'|'text', delta) events.
 
     Each event carries the full text so far; a delta is the new suffix. A
-    non-prefix rewrite is a protocol error worth retrying from scratch.
+    non-prefix rewrite of the answer is a protocol error worth retrying from
+    scratch; a rewrite of the thinking trace (new thought section) is emitted
+    as a fresh paragraph instead.
     """
-    prev = ""
+    prev_text = ""
+    prev_thought = ""
     for raw in lines:
-        text = clean_text(extract_line_text(raw))
+        text, thought = extract_line_parts(raw)
+        if thought:
+            if thought.startswith(prev_thought):
+                delta = thought[len(prev_thought):]
+            elif len(thought) > len(prev_thought):
+                delta = "\n\n" + thought
+            else:
+                delta = ""
+            prev_thought = thought
+            if delta:
+                yield ("thought", delta)
+        text = clean_text(text)
         if not text:
             continue
-        if not text.startswith(prev):
+        if not text.startswith(prev_text):
             raise RetryableError("Gemini rewrote its earlier output mid-stream.", kind="rewrite")
-        if len(text) > len(prev):
-            yield text[len(prev):]
-            prev = text
+        if len(text) > len(prev_text):
+            yield ("text", text[len(prev_text):])
+            prev_text = text
+
+
+def iter_deltas(lines):
+    """Text-only view of iter_events (answer content deltas)."""
+    for kind, delta in iter_events(lines):
+        if kind == "text":
+            yield delta
 
 
 # --------------------------------------------------------------------------
@@ -531,33 +582,45 @@ class GeminiClient:
             time.sleep(self._backoff(attempt, last))
         raise last
 
-    def stream_generate(self, prompt, file_refs=None, model_info=None):
-        """Yields content deltas. Retries only before the first emitted delta."""
+    def stream_events(self, prompt, file_refs=None, model_info=None):
+        """Yields ('thought', delta) / ('text', delta) events.
+
+        Retries only before the first text delta; thought-only progress does
+        not block a retry (a repeated thinking trace is cosmetic, an empty
+        answer is not).
+        """
         if self._http() is None:  # no httpx -> non-streaming fallback
-            yield self.generate(prompt, file_refs, model_info)
+            yield ("text", self.generate(prompt, file_refs, model_info))
             return
         if self._use_curl_for_files(file_refs):
             # curl_cffi transport is used non-streamed for file requests;
             # the full answer arrives as a single delta.
-            yield self.generate(prompt, file_refs, model_info)
+            yield ("text", self.generate(prompt, file_refs, model_info))
             return
         self._prepare_xsrf()
         inner = build_inner(prompt, file_refs or [], model_info,
                             temporary_chats=self.cfg.temporary_chats)
         last = None
         for attempt in range(max(1, self.cfg.retry_attempts)):
-            emitted = False
+            text_emitted = False
             try:
-                for delta in iter_deltas(self._post_stream_once(inner)):
-                    emitted = True
-                    yield delta
-                if not emitted:
+                for kind, delta in iter_events(self._post_stream_once(inner)):
+                    if kind == "text":
+                        text_emitted = True
+                    yield kind, delta
+                if not text_emitted:
                     raise RetryableError("Gemini returned an empty stream.", kind="empty")
                 return
             except (RetryableError, RateLimitedError, GeminiError) as exc:
                 last = exc
-                if emitted:
+                if text_emitted:
                     raise
                 self._recover(exc)
             time.sleep(self._backoff(attempt, last))
         raise last
+
+    def stream_generate(self, prompt, file_refs=None, model_info=None):
+        """Yields answer content deltas (thinking trace filtered out)."""
+        for kind, delta in self.stream_events(prompt, file_refs, model_info):
+            if kind == "text":
+                yield delta
