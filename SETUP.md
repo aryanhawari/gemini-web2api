@@ -10,18 +10,18 @@ pip install httpx        # sirf ye ek dependency (streaming ke liye)
 ## 2. Run
 
 ```bash
-python -m gemini_web2api             # default: http://0.0.0.0:8081
+python -m gemini_web2api             # default: http://0.0.0.0:8000
 # ya options ke saath:
-python -m gemini_web2api --port 8081 --cookie-file cookie.txt --proxy http://127.0.0.1:7890
+python -m gemini_web2api --port 8000 --cookie-file cookie.txt --proxy http://127.0.0.1:7890
 ```
 
 Anonymous mode me turant chal jayega (Flash models). Verify:
 
 ```bash
-curl http://localhost:8081/
+curl http://localhost:8000/
 # {"status": "ok", ...}
 
-curl http://localhost:8081/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"Hi"}]}'
 ```
@@ -50,7 +50,7 @@ image upload reliable. **Personal/family Google account use karo.**
 
 Cookie file **mtime-cached** hai — file badlo, server restart ki zaroorat nahi.
 
-**Verify karo:** browser me `http://localhost:8081/` kholo → `"cookie": "loaded"` dikhega.
+**Verify karo:** browser me `http://localhost:8000/` kholo → `"cookie": "loaded"` dikhega.
 Images ke liye `"images": "ready"` bhi dikhna chahiye (install: `pip install gemini-webapi`).
 
 ### Multiple Google accounts
@@ -71,7 +71,7 @@ cp config.example.json config.json
 
 | Key | Default | Matlab |
 |---|---|---|
-| `port` / `host` | 8081 / 0.0.0.0 | server bind |
+| `port` / `host` | 8000 / 0.0.0.0 | server bind |
 | `api_keys` | `[]` | empty = no auth; `["sk-x"]` = Bearer/x-api-key/`?key=` auth |
 | `default_model` | gemini-3.6-flash | unknown model ka fallback |
 | `cookie_file` | null | cookie.txt / cookie.json path |
@@ -88,7 +88,7 @@ Config search order: `--config` flag → `GEMINI_WEB2API_CONFIG` env →
 
 **Cherry Studio / ChatBox / koi bhi OpenAI app**
 
-- API Host / Base URL: `http://localhost:8081/v1`
+- API Host / Base URL: `http://localhost:8000/v1`
 - API Key: kuch bhi (auth off hai to)
 - Model: `gemini-3.6-flash`, `gemini-3.5-flash-thinking`, ...
 
@@ -96,7 +96,7 @@ Config search order: `--config` flag → `GEMINI_WEB2API_CONFIG` env →
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="anything")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="anything")
 r = client.chat.completions.create(
     model="gemini-3.6-flash",
     messages=[{"role": "user", "content": "Hello!"}],
@@ -109,7 +109,7 @@ for chunk in r:
 **Codex CLI** (Responses API)
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:8081/v1
+export OPENAI_BASE_URL=http://localhost:8000/v1
 export OPENAI_API_KEY=anything
 codex --model gemini-3.6-flash
 ```
@@ -118,7 +118,7 @@ codex --model gemini-3.6-flash
 
 ```bash
 export GEMINI_API_KEY=anything
-# config me endpoint: http://localhost:8081
+# config me endpoint: http://localhost:8000
 gemini -m gemini-3.6-flash
 ```
 
@@ -126,7 +126,7 @@ gemini -m gemini-3.6-flash
 
 ```bash
 cp config.example.json config.json
-docker compose up -d          # http://localhost:8081
+docker compose up -d          # http://localhost:8000
 ```
 
 Agar upstream 403/429 de (Docker Desktop NAT IP ranges Gemini reject karta hai):
@@ -147,7 +147,7 @@ python -m unittest discover -s tests     # 53 tests — sab mocked, bina network
 | `upstream 400` | xsrf token — cookie ke saath auto-refresh hota hai; kai baar fail ho to cookies dobara copy karo |
 | `upstream 403` | cookies missing/rejected — naya cookie copy karo, ya anonymous raho |
 | `upstream 429` | rate limit — cookies lagao, `retry_delay_sec` badhao, ya proxy rotate karo |
-| Image upload fails | images ke liye cookie zaroori (`__Secure-1PSID` cookie.txt me) + `pip install gemini-webapi`; `http://localhost:8081/` par `"images": "ready"` hona chahiye |
+| Image upload fails | images ke liye cookie zaroori (`__Secure-1PSID` cookie.txt me) + `pip install gemini-webapi`; `http://localhost:8000/` par `"images": "ready"` hona chahiye |
 | Pro model Flash jaisa behave karta hai | expected — Pro ke liye Gemini Advanced cookie chahiye |
 | Streaming ek hi chunk me | tools use kar rahe ho ya image bheji hai — full response chahiye (by design) |
 

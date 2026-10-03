@@ -22,7 +22,7 @@ BOOL_FIELDS = {"log_requests", "temporary_chats"}
 
 @dataclass
 class Config:
-    port: int = 8081
+    port: int = 8000
     host: str = "0.0.0.0"
     retry_attempts: int = 3
     retry_delay_sec: float = 2.0
@@ -159,7 +159,7 @@ def parse_args(argv=None):
         prog="gemini-web2api",
         description="OpenAI-compatible API server for the Gemini web app (reverse-engineered).",
     )
-    parser.add_argument("--port", type=int, help="listen port (default 8081)")
+    parser.add_argument("--port", type=int, help="listen port (default 8000)")
     parser.add_argument("--host", help="bind address (default 0.0.0.0)")
     parser.add_argument("--config", help="path to config.json")
     parser.add_argument("--cookie-file", help="path to cookie file (header string or JSON)")

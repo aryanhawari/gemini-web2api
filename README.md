@@ -13,11 +13,11 @@ bina payment. Koi bhi OpenAI client (Cherry Studio, ChatBox, Codex CLI, Gemini C
 
 ```bash
 pip install -r requirements.txt   # httpx + curl_cffi + gemini-webapi
-python -m gemini_web2api          # http://localhost:8081 par start
+python -m gemini_web2api          # http://localhost:8000 par start
 ```
 
 ```bash
-curl http://localhost:8081/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
@@ -26,7 +26,7 @@ Kisi bhi OpenAI client me:
 
 | Setting | Value |
 |---|---|
-| Base URL | `http://localhost:8081/v1` |
+| Base URL | `http://localhost:8000/v1` |
 | API key | kuch bhi (jab tak `api_keys` config me empty hai) |
 | Model | `gemini-3.6-flash` (ya niche wali table se koi bhi) |
 
@@ -85,6 +85,13 @@ transfer-encoding request bodies bhi manually parse hoti hain. CORS headers enab
 
 - **Streaming** — Gemini har event me full text bhejta hai; server `delta = new[len(prev):]`
   karke sirf naya hissa SSE me bhejta hai. Mid-stream rewrite par auto-retry.
+- **Thinking trace (`reasoning_content`)** — Gemini jawab se pehle ~2-6s "sochta" hai
+  (ye upstream latency hai, kam nahi ho sakti). Server us thinking trace ko
+  OpenAI-style `reasoning_content` deltas me stream karta hai (DeepSeek jaisa) —
+  ChatBox / NextChat / LobeChat isse "thinking" pane me dikhati hain, isliye wait
+  me bhi activity dikhti hai. Non-streaming me `message.reasoning_content` field.
+  Thinking text upstream candidate ke index `[37]` me rehti hai; absent hone par
+  field nahi bhejta (purane shapes safe).
 - **Multi-turn** — har request single-turn hoti hai; poori history ek flat prompt me
   simulate hoti hai (`[System instruction]:`, `[Assistant]:`, `[Tool result for X]:` markers).
 - **Tool calling** — OpenAI `tools[]` prompt me inject hote hain; model ``` ```tool_call ```
@@ -107,7 +114,7 @@ transfer-encoding request bodies bhi manually parse hoti hain. CORS headers enab
 
 ```json
 {
-  "port": 8081, "host": "0.0.0.0",
+  "port": 8000, "host": "0.0.0.0",
   "retry_attempts": 3, "retry_delay_sec": 2, "request_timeout_sec": 180,
   "auth_user": null,          // /u/N/ account index (multi-account Google)
   "xsrf_token": null,         // auto-fetch hota hai cookie hone par
