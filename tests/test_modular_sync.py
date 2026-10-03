@@ -380,14 +380,17 @@ class ConfigTest(unittest.TestCase):
 
     def test_env_config_load(self):
         old = os.environ.get("GEMINI_WEB2API_CONFIG")
+        old_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump({"port": 9999, "api_keys": ["k1"], "temporary_chats": True}, fh)
             os.environ["GEMINI_WEB2API_CONFIG"] = path
+            os.chdir(tmp)  # isolate from any real .env in the repo cwd
             try:
                 cfg = load_config()
             finally:
+                os.chdir(old_cwd)
                 if old is None:
                     os.environ.pop("GEMINI_WEB2API_CONFIG", None)
                 else:
