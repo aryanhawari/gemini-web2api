@@ -297,6 +297,12 @@ def make_handler(app):
                                else "native engine (pip install gemini-webapi for best results)"),
                 })
                 return
+            if path == "/favicon.ico":
+                # browsers request this unprompted on every page visit; a
+                # 204 keeps 401 noise out of otherwise-clean request logs
+                self.send_response(204)
+                self.end_headers()
+                return
             if not self._authorized():
                 self._send_error_json(401, "invalid API key", "authentication_error")
                 return

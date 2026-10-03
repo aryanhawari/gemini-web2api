@@ -530,6 +530,11 @@ class ServerEndpointsTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "ok")
 
+    def test_favicon_open_no_401(self):
+        # browsers hit /favicon.ico unprompted; it must not 401 (log noise)
+        status, _ = request(self.port, "GET", "/favicon.ico")
+        self.assertEqual(status, 204)
+
     def test_v1_models(self):
         status, body = request(self.port, "GET", "/v1/models")
         self.assertEqual(status, 200)

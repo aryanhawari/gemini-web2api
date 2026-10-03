@@ -1,0 +1,9 @@
+# normalize line endings: LF everywhere in the repo AND the working copy,
+# so Windows checkouts stop emitting "LF will be replaced by CRLF" warnings
+* text=auto eol=lf
+
+# cmd.exe batch files are safest with CRLF
+*.bat text eol=crlf
+
+# binaries — never touch
+*.png binary
