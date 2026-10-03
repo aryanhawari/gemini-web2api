@@ -12,3 +12,5 @@ gemini-auth.json
 server.log
 auth_server.log
 auth_test_config.json
+server.log
+railway_login.log
