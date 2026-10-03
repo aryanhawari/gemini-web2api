@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Gemini Web2API logo" width="280">
+</p>
+
 # gemini-web2api
 
 Google Gemini ke **web app** ke internal (reverse-engineered) `StreamGenerate` endpoint ko
