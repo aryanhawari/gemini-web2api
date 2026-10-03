@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# secrets / local config
+config.json
+cookie.txt
+gemini-auth.json
+.env
+server.log
+auth_server.log
+auth_test_config.json

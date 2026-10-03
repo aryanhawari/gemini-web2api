@@ -1,0 +1,13 @@
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      # - ./cookie.txt:/app/cookie.txt:ro   # uncomment and set "cookie_file": "cookie.txt" in config.json
+    restart: unless-stopped
+    # NOTE: on Docker Desktop, Gemini may reject requests from NAT'd IP ranges.
+    # If you keep getting 403/429 from upstream, try --network host (Linux) or
+    # set a proxy in config.json.
