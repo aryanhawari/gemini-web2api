@@ -1,0 +1,5 @@
+
+  → Opening your browser to sign in — finish there.
+    https://backboard.railway.com/oauth/auth?response_type=code&client_id=rlwy_oaci_onEklvmksh1hRUiCo7E2zX12&redirect_uri=http%3A%2F%2F127.0.0.1%3A59620%2Fcallback&scope=openid+email+profile+offline_access+workspace%3Aadmin+project%3Aadmin+ssh_keys&code_challenge=vs_1q-1QG20udIg7LX-LeLL1G4yJCBP_SzfhrXOmzl4&code_challenge_method=S256&state=lqlRw5uNGxvgyHr8-C5SACzAq7zWFLcSwMPxmGHgrXk&prompt=consent&cli_caller=agent_unknown%3Anode
+
+  ✓ Signed in as Aryan Hawari (aryanhawari9999@gmail.com)

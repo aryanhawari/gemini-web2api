@@ -41,6 +41,8 @@ class LibraryEngine:
             return False
 
     def _psid_pair(self):
+        if self._cookies is None:
+            return None, None
         cookie, _ = self._cookies.get()
         psid = re.search(r"__Secure-1PSID=([^;]+)", cookie)
         if not psid:
