@@ -195,18 +195,24 @@ def _candidate_text(candidate):
 def _thought_text(candidate):
     """Extracts the thinking-trace text from one candidate ('' if none).
 
-    Thoughts live at candidate[37] (2026 shape) as the same text duplicated
-    at several depths (markdown + plain copies). Taking the longest string in
-    the subtree is robust against minor shape drift.
+    Thoughts live at candidate[37] (2026 shape): the markdown snapshot is the
+    [37][0] subtree — its longest string is the thought; the whole subtree is
+    thought text. Code-execution/tool chips park their UI strings (icon
+    URLs, executed code, captions) under [37][1], which must be ignored —
+    those otherwise leak in as fake reasoning. A 50-char floor drops trivial
+    leftovers; real thought snapshots are full markdown texts.
     """
     if not isinstance(candidate, list) or len(candidate) <= 37:
         return ""
+    root = candidate[37]
+    if not (isinstance(root, list) and root and isinstance(root[0], list)):
+        return ""
     best = ""
-    stack = [candidate[37]]
+    stack = [root[0]]
     while stack:
         node = stack.pop()
         if isinstance(node, str):
-            if len(node) > len(best):
+            if "://" not in node and len(node) > len(best) and len(node) >= 50:
                 best = node
         elif isinstance(node, list):
             stack.extend(node)

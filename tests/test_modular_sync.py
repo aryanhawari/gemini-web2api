@@ -258,18 +258,48 @@ class ResponseParseTest(unittest.TestCase):
         self.assertEqual(text, "Hello")
         self.assertEqual(thought, "")
 
+    def test_thought_ignores_chip_junk(self):
+        # code-execution responses park icon URLs + short chip captions in
+        # candidate[37]; they must not leak out as reasoning_content
+        inner = [None] * 20
+        candidate = ["rc", [""]]
+        candidate += [None] * 35
+        candidate.append([["https://drive-thirdparty.googleusercontent.com/32/type/text/code"],
+                          ["Processed and analyzed in code"],
+                          ["print(12 + 12)"], ["Analyzed"]])
+        inner[4] = [candidate]
+        line = json.dumps([["wrb.fr", None, json.dumps(inner), None] + [None] * 5])
+        self.assertEqual(extract_line_parts(line), ("", ""))
+
+    def test_thought_long_text_beats_junk(self):
+        real = "**Thinking**\n\n" + "very long thought " * 10
+        inner = [None] * 20
+        candidate = ["rc", [""]]
+        candidate += [None] * 35
+        # real shape: markdown thought at [37][0], tool-chip junk at [37][1]
+        candidate.append([[real],
+                          ["Processed and analyzed in code",
+                           "https://drive-thirdparty.googleusercontent.com/icon",
+                           "print(1 + 1)", "python"]])
+        inner[4] = [candidate]
+        line = json.dumps([["wrb.fr", None, json.dumps(inner), None] + [None] * 5])
+        _, thought = extract_line_parts(line)
+        self.assertEqual(thought, real)
+
     def test_iter_events_thought_then_text(self):
-        lines = [thought_frame_line("step one"),
-                 thought_frame_line("step one step two", "Answer here")]
+        base = "Pondering deeply about the question at hand: "
+        lines = [thought_frame_line(base + "step one"),
+                 thought_frame_line(base + "step one step two", "Answer here")]
         events = list(iter_events(lines))
         self.assertEqual([kind for kind, _ in events],
                          ["thought", "thought", "text"])
-        self.assertEqual(events[0][1], "**Thinking**\n\nstep one")
+        self.assertEqual(events[0][1], "**Thinking**\n\n" + base + "step one")
         self.assertEqual(events[1][1], " step two")
         self.assertEqual(events[2][1], "Answer here")
 
     def test_iter_events_thought_shrink_is_skipped(self):
-        lines = [thought_frame_line("long thought here"),
+        long_one = "a very long thinking snapshot that will later shrink away now"
+        lines = [thought_frame_line(long_one),
                  thought_frame_line("short", "Answer")]
         events = list(iter_events(lines))
         thoughts = [d for kind, d in events if kind == "thought"]
