@@ -33,6 +33,7 @@ class Config:
     default_model: str = "gemini-3.6-flash"
     api_keys: List[str] = None               # empty list = no auth
     cookie_file: Optional[str] = None        # cookie.txt path
+    cookie_string: Optional[str] = None      # full Cookie header (env COOKIE_STRING)
     proxy: Optional[str] = None              # e.g. http://127.0.0.1:7890
     log_requests: bool = True
     temporary_chats: bool = False            # true = history not saved on the account
@@ -82,6 +83,12 @@ def _apply_env_overrides(cfg: Config, env: dict) -> None:
             if k and k not in keys:
                 keys.append(k)
     cfg.api_keys = keys
+
+    raw_cookie = env.get("COOKIE_STRING", "").strip()
+    if raw_cookie:
+        cfg.cookie_string = raw_cookie
+        if not cfg.cookie_file:
+            cfg.cookie_file = None  # env cookie wins when no file configured
 
     if env.get("RETRY_ATTEMPTS", "").strip().isdigit():
         cfg.retry_attempts = int(env["RETRY_ATTEMPTS"])
@@ -170,6 +177,18 @@ def apply_args(cfg: Config, args) -> Config:
     if getattr(args, "proxy", None):
         cfg.proxy = args.proxy
     return cfg
+
+
+class StaticCookieStore:
+    """Cookie source for a fixed Cookie header string (e.g. env COOKIE_STRING)."""
+
+    def __init__(self, cookie: str):
+        self.cookie = cookie
+        m = re.search(r"SAPISID=([^;\s]+)", cookie)
+        self.sapisid = m.group(1).strip() if m else ""
+
+    def get(self):
+        return self.cookie, self.sapisid
 
 
 class CookieStore:

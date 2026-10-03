@@ -273,7 +273,13 @@ def extract_build_label(html):
 class GeminiClient:
     def __init__(self, config):
         self.cfg = config
-        self.cookies = CookieStore(config.cookie_file) if config.cookie_file else None
+        if config.cookie_file:
+            self.cookies = CookieStore(config.cookie_file)
+        elif getattr(config, "cookie_string", None):
+            from .config import StaticCookieStore
+            self.cookies = StaticCookieStore(config.cookie_string)
+        else:
+            self.cookies = None
         self._http_client = None
         self._curl_client = None
         self._bl_lock = threading.Lock()
