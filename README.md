@@ -140,7 +140,7 @@ Google/Responses converters, config + cookie store, aur live HTTP server tests
 
 ## Deployment
 
-**Local:** `pip install httpx && python -m gemini_web2api`
+**Local:** `pip install -r requirements.txt && python -m gemini_web2api`
 
 **Docker:**
 ```bash
@@ -149,6 +149,22 @@ docker compose up -d
 ```
 Docker Desktop par Gemini NAT IP ranges reject kar sakta hai → Linux par
 `--network host`, ya config me `proxy` set karo.
+
+**Railway:**
+1. GitHub repo (`aryanhawari/gemini-web2api`) ko Railway se connect karo
+   (ya CLI: `npx @railway/cli login` → `railway init` → `railway up`).
+2. Railway Variables me set karo:
+   - `PROXY_API_KEY` = tumhari private key (.env jaisi, khud generate ki hui)
+   - `COOKIE_STRING` = (optional, images ke liye) poori Cookie header string
+3. Deploy hoga Dockerfile se — server `0.0.0.0:$PORT` par bind hota hai.
+4. Railway Settings → Networking → Generate Domain → wahi production Base URL hai:
+   `https://<railway-domain>/v1`
+
+Supported env vars: `PROXY_API_KEY`, `PROXY_API_KEYS` (comma list), `COOKIE_STRING`,
+`RETRY_ATTEMPTS`, `REQUEST_TIMEOUT_SEC`, `MAX_CONCURRENT_REQUESTS`, `MAX_BODY_MB`, `PORT`.
+**Note:** `.env`/cookie.txt GitHub me nahi hain (gitignored) — Railway par values
+Variables se aati hain. Binna cookie Railway par anonymous Flash models chalenge
+(rate-limited); `COOKIE_STRING` doge to images + stable quota bhi.
 
 ## Limitations / Risks
 
