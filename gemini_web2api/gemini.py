@@ -55,6 +55,8 @@ except ImportError:  # pragma: no cover - h2 optional; HTTP/2 only when present
     HAVE_H2 = False
 
 KEEPALIVE_EXPIRY_SEC = 600  # hold pooled TLS connections far beyond httpx's 5s default
+HTTP_MAX_CONNECTIONS = 64        # total pooled sockets (pool is never the bottleneck)
+HTTP_MAX_KEEPALIVE = 32          # idle sockets kept warm for the next burst
 
 
 class GeminiError(RuntimeError):
@@ -377,14 +379,24 @@ class GeminiClient:
         HTTP/2 is enabled when the h2 package is available (fewer handshakes
         under concurrency); keep-alive expiry is raised from httpx's 5s
         default so an idle minute between chats does not cost a fresh
-        TCP+TLS handshake.
+        TCP+TLS handshake. Timeouts are split so a slow upstream connect or
+        a saturated pool fails in seconds instead of hanging a worker.
         """
         if self._http_client is None and HAVE_HTTPX:
+            timeout = httpx.Timeout(
+                connect=min(10.0, float(self.cfg.request_timeout_sec)),
+                read=float(self.cfg.request_timeout_sec),
+                write=30.0,
+                pool=10.0,
+            )
             common = dict(
-                timeout=self.cfg.request_timeout_sec,
+                timeout=timeout,
                 follow_redirects=True,
                 http2=HAVE_H2,
-                limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
+                limits=httpx.Limits(
+                    max_connections=HTTP_MAX_CONNECTIONS,
+                    max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+                    keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
                 headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
             )
             if self.cfg.proxy:
@@ -581,10 +593,21 @@ class GeminiClient:
                     yield raw
 
     def _backoff(self, attempt, exc):
-        delay = self.cfg.retry_delay_sec * (2 ** attempt)
+        """Kind-aware retry delay in seconds.
+
+        bl/xsrf retries sleep almost not at all (the recovery page fetch
+        itself absorbed the wait), empty streams re-run near-instantly, and
+        rate limits honor Retry-After; everything else gets a capped
+        exponential curve so a bad patch never stalls workers for minutes.
+        """
         if isinstance(exc, RateLimitedError) and exc.retry_after:
-            delay = max(delay, exc.retry_after)
-        return delay + random.uniform(0, 0.5)
+            return exc.retry_after + random.uniform(0, 0.25)
+        kind = getattr(exc, "kind", "")
+        if kind in ("bl", "xsrf"):
+            return random.uniform(0, 0.15)
+        if kind == "empty":
+            return 0.25 * (attempt + 1) + random.uniform(0, 0.1)
+        return min(self.cfg.retry_delay_sec * (2 ** attempt), 8.0) + random.uniform(0, 0.25)
 
     def _recover(self, exc):
         if isinstance(exc, RetryableError) and exc.kind == "bl":

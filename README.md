@@ -46,7 +46,7 @@ web2api/
 │   ├── tools.py               #   messages→prompt conversion + tool_call parsing
 │   ├── multimodal.py          #   image upload (Scotty resumable upload)
 │   └── server.py              #   HTTP endpoints (OpenAI + Google native formats)
-├── tests/test_modular_sync.py # 53 unit tests (sab mocked — bina network chalte hain)
+├── tests/test_modular_sync.py # 72 unit tests (sab mocked — bina network chalte hain)
 ├── config.example.json        # config template
 ├── Dockerfile + docker-compose.yml
 └── SETUP.md                   # step-by-step setup guide
@@ -67,8 +67,42 @@ web2api/
 **API key auth** (optional, `api_keys` config): `Authorization: Bearer <key>`,
 `x-api-key:`, `x-goog-api-key:`, ya `?key=` — chaarõ chalte hain. Empty list = no auth.
 
-**Server:** stdlib `ThreadingHTTPServer` — koi Flask/FastAPI nahi. Chunked
-transfer-encoding request bodies bhi manually parse hoti hain. CORS headers enabled.
+**Server:** bounded worker-pool `HTTPServer` (64 daemon threads, fixed footprint —
+spike par bhi thread explosion nahi). Chunked transfer-encoding request bodies bhi
+manually parse hoti hain. CORS headers enabled.
+
+## Reasoning control (off / low / medium / high / max)
+
+Teen tarike se reasoning depth control karo — dono same upstream `think` field
+(0 = deepest … 4 = shallowest/off) par map hote hain:
+
+**1. OpenAI-style `reasoning_effort` param** (chat completions + responses):
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3.6-flash","reasoning_effort":"off",
+       "messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+| `reasoning_effort` | think depth | MATLAB |
+|---|---|---|
+| `off` / `minimal` / `none` | 4 | sabse fast — thinking skip, seedha jawab |
+| `low` | 3 | halki soch |
+| `medium` / `med` | 2 | balanced |
+| `high` | 1 | gehri soch |
+| `max` / `ultra` | 0 | deepest thinking (sabse slow, sabse smart) |
+
+**2. `@think=` model suffix** (ab words bhi chalte hain):
+`gemini-3.6-flash@think=off`, `@think=low`, `@think=high`, `@think=max`, ya purane
+digits `@think=0..4`.
+
+**3. Google-native `thinkingConfig`**: `generationConfig.thinkingConfig.thinkingBudget`
+— `0` = off, `-1` = dynamic(≈medium), positive budget buckets (≤4096 low … >24576 max).
+
+> Latency ka sach: `off` par bhi upstream Gemini ko jawab generate karne me
+> ~1-3s lagte hain — ye Google ka time hai, kam nahi ho sakta. Server khud
+> har request par sirf ~1-20ms add karta hai (live-measured).
 
 ## Models
 
@@ -127,7 +161,11 @@ transfer-encoding request bodies bhi manually parse hoti hain. CORS headers enab
   "cookie_file": null,        // "cookie.txt"
   "proxy": null,              // "http://127.0.0.1:7890" (Clash/V2Ray)
   "log_requests": true,
-  "temporary_chats": false    // true = history account me save nahi hogi
+  "temporary_chats": false,   // true = history account me save nahi hogi
+  "state_refresh_sec": 300,   // background BL+xsrf refresh (0 = off)
+  "max_concurrent_requests": 8, // upstream parallel Gemini calls ki limit
+  "queue_wait_sec": 30,       // busy hone par max itna wait, phir 429 (0 = infinite)
+  "pool_workers": 64          // HTTP worker threads (high traffic me badha sakte ho)
 }
 ```
 
@@ -138,16 +176,44 @@ Config search order: `--config` → `GEMINI_WEB2API_CONFIG` env → `./config.js
 ## Tests
 
 ```bash
-python -m unittest discover -s tests   # 53 tests, sab mocked — bina network
+python -m unittest discover -s tests   # 72 tests, sab mocked — bina network
 ```
 
-Coverage: payload flags ([41]/[45]), file refs, model resolution + @think,
-response parsing (current `["OK-"]` shape + legacy shape, progressive text,
-BardErrorInfo, error frames, stream rewrite detection), build-label extraction
-(cfb2h + legacy), prompt building, tool parsing (OpenAI + Google + raw JSON),
-Google/Responses converters, config + cookie store, aur live HTTP server tests
-(SSE chunk order, chunked bodies, tool_calls, Responses event sequence,
-502 on upload failure, auth 401).
+Coverage: payload flags ([41]/[45]), file refs, model resolution + @think (digits +
+off/low/medium/high/max words), reasoning_effort/thinkingBudget mapping, response
+parsing (current `["OK-"]` shape + legacy shape, progressive text, BardErrorInfo,
+error frames, stream rewrite detection), build-label extraction (cfb2h + legacy),
+prompt building, tool parsing (OpenAI + Google + raw JSON), Google/Responses
+converters, config + cookie store, aur live HTTP server tests (SSE chunk order,
+chunked bodies, tool_calls, Responses event sequence, 502 on upload failure,
+auth 401, busy-429 overload shedding).
+
+## Latency & high-traffic engineering
+
+Server-side har request ka overhead ~1-20ms hai (live-measured `health` 1-2ms,
+streaming headers+first-chunk ~1ms keep-alive par). Jo isme hai:
+
+- **Instant SSE flush** — headers + role chunk turant jaate hain; client ko first
+  byte ke liye upstream ka wait nahi karna padta (TTFB ~1ms local).
+- **Bounded worker pool** — 64 daemon threads, fixed memory; `ThreadingHTTPServer`
+  jaisa thread-per-connection explosion nahi. Queue bharne par connection turant drop.
+- **Overload shedding** — `max_concurrent_requests` slots busy ho jayein to request
+  `queue_wait_sec` (default 30s) tak wait karta hai, phir clean `429` + `Retry-After`.
+  Infinite hang kabhi nahi.
+- **Fast accept loop** — 50ms selector wakeup (500ms default ke bajaye), nayi
+  connections ~25ms me accept hoti hain.
+- **Warm connection pool** — HTTP/2 + 600s keep-alive; 64-connection cap with
+  32 warm idle sockets, burst turant serve hota hai.
+- **Split timeouts** — connect 10s fail-fast, pool-wait 10s (koi request kabhi
+  connection ke liye infinite block nahi karti), read = request_timeout_sec.
+- **Kind-aware retries** — build-label/xsrf retry par faltu sleep nahi (recovery
+  fetch khud wait hai), empty stream par 0.25s fast re-run, 429 par `Retry-After`.
+- **Slow-client reaping** — idle/stuck connections 120s me kill (slowloris-safe).
+- **Background state refresher** — har `state_refresh_sec` (300s) me BL+xsrf
+  prefetch, isliye real requests kabhi 405/400 recovery path me nahi jaati.
+
+Load-verified: 12 parallel streaming requests, 8 upstream slots — 12/12 success,
+queued requests bhi queue se hi serve hui, koi hang/timeout nahi.
 
 ## Deployment
 
@@ -172,7 +238,8 @@ Docker Desktop par Gemini NAT IP ranges reject kar sakta hai → Linux par
    `https://<railway-domain>/v1`
 
 Supported env vars: `PROXY_API_KEY`, `PROXY_API_KEYS` (comma list), `COOKIE_STRING`,
-`RETRY_ATTEMPTS`, `REQUEST_TIMEOUT_SEC`, `MAX_CONCURRENT_REQUESTS`, `MAX_BODY_MB`, `PORT`.
+`RETRY_ATTEMPTS`, `REQUEST_TIMEOUT_SEC`, `MAX_CONCURRENT_REQUESTS`, `MAX_BODY_MB`,
+`STATE_REFRESH_SEC`, `POOL_WORKERS`, `QUEUE_WAIT_SEC`, `PORT`.
 **Note:** `.env`/cookie.txt GitHub me nahi hain (gitignored) — Railway par values
 Variables se aati hain. Binna cookie Railway par anonymous Flash models chalenge
 (rate-limited); `COOKIE_STRING` doge to images + stable quota bhi.

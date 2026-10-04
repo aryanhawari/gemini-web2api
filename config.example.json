@@ -13,5 +13,8 @@
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false,
-  "state_refresh_sec": 300
+  "state_refresh_sec": 300,
+  "max_concurrent_requests": 8,
+  "queue_wait_sec": 30,
+  "pool_workers": 64
 }

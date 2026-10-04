@@ -6,12 +6,24 @@ The mode id is sent in payload field [79]; thinking depth in [17].
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Optional
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 
-THINK_SUFFIX_RE = re.compile(r"@think=([0-4])$")
+# Reasoning-effort aliases -> thinking depth (0 deepest .. 4 shallowest/off).
+# "off" sends the shallowest depth, which upstream answers without a visible
+# thinking phase — the lowest-latency path for every model.
+EFFORT_TO_THINK = {
+    "off": 4, "none": 4, "minimal": 4,
+    "low": 3,
+    "med": 2, "medium": 2,
+    "high": 1,
+    "max": 0, "ultra": 0,
+}
+
+THINK_SUFFIX_RE = re.compile(r"@think=([0-4]|off|none|minimal|low|med|medium|high|max|ultra)$",
+                             re.IGNORECASE)
 
 
 @dataclass
@@ -44,7 +56,7 @@ def is_known_model(name):
 
 
 def resolve_model(name: Optional[str]) -> ModelInfo:
-    """Resolves a requested model name (with optional @think=N suffix).
+    """Resolves a requested model name (with optional @think=N|off|low|...|max suffix).
 
     Unknown names silently fall back to DEFAULT_MODEL.
     """
@@ -52,7 +64,8 @@ def resolve_model(name: Optional[str]) -> ModelInfo:
     think_override = None
     m = THINK_SUFFIX_RE.search(clean)
     if m:
-        think_override = int(m.group(1))
+        token = m.group(1).lower()
+        think_override = int(token) if token.isdigit() else EFFORT_TO_THINK.get(token)
         clean = clean[: m.start()]
     spec = MODELS.get(clean)
     if spec is None:
@@ -66,6 +79,38 @@ def resolve_model(name: Optional[str]) -> ModelInfo:
         extra=spec.get("extra"),
         description=spec.get("description", ""),
     )
+
+
+def apply_reasoning_effort(info: ModelInfo, effort) -> ModelInfo:
+    """Applies an OpenAI-style reasoning_effort value ('off'..'max') on top of
+    a resolved model. Unknown/missing values leave the model default intact."""
+    key = str(effort or "").strip().lower()
+    if key in EFFORT_TO_THINK:
+        return replace(info, think=EFFORT_TO_THINK[key])
+    return info
+
+
+def apply_thinking_budget(info: ModelInfo, budget) -> ModelInfo:
+    """Maps a Gemini-style thinkingConfig.thinkingBudget onto thinking depth.
+
+    0 = off (shallowest), -1 = dynamic (medium), positive budgets bucket into
+    low/medium/high/max as they grow.
+    """
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError):
+        return info
+    if budget == 0:
+        return replace(info, think=4)
+    if budget < 0:
+        return replace(info, think=2)
+    if budget <= 4096:
+        return replace(info, think=3)
+    if budget <= 12288:
+        return replace(info, think=2)
+    if budget <= 24576:
+        return replace(info, think=1)
+    return replace(info, think=0)
 
 
 def list_model_infos():

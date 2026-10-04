@@ -146,6 +146,30 @@ class ModelResolutionTest(unittest.TestCase):
         self.assertEqual(info.think, 2)
         self.assertEqual(resolve_model("gemini-auto@think=0").think, 0)
 
+    def test_think_suffix_words(self):
+        cases = {"off": 4, "minimal": 4, "low": 3, "medium": 2, "med": 2,
+                 "high": 1, "max": 0, "ultra": 0}
+        for word, think in cases.items():
+            info = resolve_model(f"gemini-3.6-flash@think={word}")
+            self.assertEqual(info.name, "gemini-3.6-flash", word)
+            self.assertEqual(info.think, think, word)
+        upper = resolve_model("gemini-3.6-flash@think=Low")
+        self.assertEqual(upper.think, 3)
+
+    def test_reasoning_effort_helper(self):
+        from gemini_web2api.models import apply_reasoning_effort, apply_thinking_budget
+        info = resolve_model("gemini-3.6-flash")  # default think=4
+        self.assertEqual(apply_reasoning_effort(info, "off").think, 4)
+        self.assertEqual(apply_reasoning_effort(info, "low").think, 3)
+        self.assertEqual(apply_reasoning_effort(info, "medium").think, 2)
+        self.assertEqual(apply_reasoning_effort(info, "high").think, 1)
+        self.assertEqual(apply_reasoning_effort(info, "max").think, 0)
+        self.assertEqual(apply_reasoning_effort(info, "bogus").think, info.think)
+        self.assertEqual(apply_thinking_budget(info, 0).think, 4)
+        self.assertEqual(apply_thinking_budget(info, -1).think, 2)
+        self.assertEqual(apply_thinking_budget(info, 1024).think, 3)
+        self.assertEqual(apply_thinking_budget(info, 32768).think, 0)
+
     def test_unknown_falls_back(self):
         self.assertEqual(resolve_model("gpt-9000").name, DEFAULT_MODEL)
         self.assertEqual(resolve_model(None).name, DEFAULT_MODEL)
@@ -711,6 +735,38 @@ class ServerEndpointsTest(unittest.TestCase):
         finally:
             sock.close()
         self.assertIn(b'"chat.completion"', data)
+
+    def test_busy_returns_429_with_retry_after(self):
+        # hold the only upstream slot; queue_wait_sec must shed load with 429
+        app = make_app(FakeGemini("ok"), max_concurrent_requests=1, queue_wait_sec=0.2)
+        server = make_server(app)
+        try:
+            self.assertTrue(app.semaphore.acquire(timeout=5))
+            try:
+                status, body = request(server.server_address[1], "POST",
+                                       "/v1/chat/completions",
+                                       {"messages": [{"role": "user", "content": "hi"}]})
+                self.assertEqual(status, 429)
+                err = json.loads(body)["error"]
+                self.assertEqual(err["code"], "server_busy")
+            finally:
+                app.semaphore.release()
+        finally:
+            server.shutdown()
+
+    def test_chat_stream_reasoning_effort_reaches_model(self):
+        fake = FakeGemini("ok")
+        server = make_server(make_app(fake))
+        try:
+            status, _ = request(server.server_address[1], "POST",
+                                "/v1/chat/completions", {
+                                    "model": "gemini-3.6-flash",
+                                    "reasoning_effort": "high",
+                                    "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(status, 200)
+            self.assertEqual(fake.calls[-1]["think"], 1)
+        finally:
+            server.shutdown()
 
 
 # ---------------------------------------------------------------------------

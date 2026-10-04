@@ -9,30 +9,79 @@ Endpoints:
   POST /v1beta/models/{model}:generateContent             Google native, non-streaming
   POST /v1beta/models/{model}:streamGenerateContent       Google native, streaming
 
-Built on stdlib ThreadingHTTPServer — no web framework. Chunked request bodies
-are decoded manually. Auth (optional): Authorization: Bearer, x-api-key,
+Built on a bounded worker-pool HTTPServer — no web framework. Chunked request
+bodies are decoded manually. Auth (optional): Authorization: Bearer, x-api-key,
 x-goog-api-key or ?key= against config.api_keys (empty list = open).
+
+Latency/stability notes:
+  - SSE headers flush immediately; upstream events forward as they arrive
+  - bounded worker pool + bounded queue shed overload cleanly (429/Retry-After)
+  - reasoning effort (off/low/medium/high/max) maps to upstream thinking depth
 """
 
 import json
+import queue
 import socket
 import sys
 import threading
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from .gemini import GeminiError, RateLimitedError
-from .models import (THINK_SUFFIX_RE, is_known_model, list_model_infos,
-                     resolve_model)
+from .models import (THINK_SUFFIX_RE, apply_reasoning_effort, apply_thinking_budget,
+                     is_known_model, list_model_infos, resolve_model)
 from .multimodal import UploadError, detect_image_mime, make_file_name
 from .tools import (PromptError, google_contents_to_messages, messages_to_prompt,
                     normalize_tools, parse_tool_calls, resolve_image,
                     responses_input_to_messages)
 
 _CREATED_TS = int(time.time())
+
+
+class PoolHTTPServer(HTTPServer):
+    """HTTP server on a fixed pool of daemon worker threads.
+
+    ThreadingHTTPServer grows a thread per connection with no ceiling — under
+    a traffic spike that means thousands of threads and trashed memory. A
+    bounded pool keeps footprint flat, reuses threads (no per-connection
+    spawn cost), and when the queue is full the connection is dropped
+    immediately instead of piling up.
+    """
+
+    # accept backlog for bursty connection storms
+    request_queue_size = 128
+
+    def __init__(self, address, handler, pool_workers=64, queue_depth=512):
+        super().__init__(address, handler)
+        self._tasks = queue.Queue(maxsize=queue_depth)
+        for _ in range(max(1, int(pool_workers))):
+            threading.Thread(target=self._work, daemon=True,
+                             name="gemini-web2api-worker").start()
+
+    def _work(self):
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            request, client = task
+            try:
+                self.finish_request(request, client)
+            except (ConnectionError, TimeoutError, socket.timeout):
+                pass  # client hung up / timed out — routine under load
+            except Exception:
+                self.handle_error(request, client)
+            finally:
+                self.shutdown_request(request)
+
+    def process_request(self, request, client_address):
+        try:
+            self._tasks.put_nowait((request, client_address))
+        except queue.Full:
+            # saturated: refuse fast instead of buffering unbounded work
+            self.shutdown_request(request)
 
 
 class App:
@@ -50,6 +99,9 @@ class App:
         self.uploader = uploader
         self.semaphore = threading.BoundedSemaphore(
             max(1, int(config.max_concurrent_requests)))
+        # max seconds a request may wait for a free upstream slot before a
+        # 429 + Retry-After is returned (0 = wait forever, legacy behavior)
+        self.queue_wait_sec = max(0.0, float(getattr(config, "queue_wait_sec", 0) or 0))
         self.image_engine = None
         if image_engine is True:
             try:
@@ -178,6 +230,9 @@ def make_handler(app):
         # Nagle off: small SSE chunks flush immediately instead of waiting on
         # delayed-ACK interaction (visible per-chunk latency on Windows)
         disable_nagle_algorithm = True
+        # idle keep-alive connections and stuck clients are reaped after 120s
+        # instead of pinning a pool worker forever (slowloris protection)
+        timeout = 120
         server_version = f"gemini-web2api/{__version__}"
         _response_started = False
 
@@ -188,12 +243,14 @@ def make_handler(app):
                 sys.stderr.write("[{}] {} {}\n".format(
                     self.log_date_time_string(), self.address_string(), fmt % args))
 
-        def _send_json(self, obj, status=200):
-            body = json.dumps(obj).encode("utf-8")
+        def _send_json(self, obj, status=200, headers=None):
+            body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -212,16 +269,23 @@ def make_handler(app):
             self._response_started = True
 
         def _sse(self, payload, event=None):
-            data = payload if isinstance(payload, str) else json.dumps(payload)
+            data = payload if isinstance(payload, str) else json.dumps(
+                payload, separators=(",", ":"))
             chunk = (f"event: {event}\n" if event else "") + f"data: {data}\n\n"
             self.wfile.write(chunk.encode("utf-8"))
             self.wfile.flush()
+
+        def _sse_stream_error(self, exc):
+            """In-stream error for clients after headers/role chunk went out."""
+            self._sse({"error": {"message": str(exc),
+                                 "type": "upstream_error", "code": "upstream_error"}})
+            self._sse("[DONE]")
 
         def _read_body(self):
             limit = int(app.config.max_body_mb * 1_000_000)
             te = (self.headers.get("Transfer-Encoding") or "").lower()
             if "chunked" in te:
-                data = b""
+                data = bytearray()
                 while True:
                     size_line = self.rfile.readline(65536).strip()
                     if b";" in size_line:
@@ -229,16 +293,16 @@ def make_handler(app):
                     try:
                         size = int(size_line or b"0", 16)
                     except ValueError:
-                        return data
+                        return bytes(data)
                     if size == 0:
                         self.rfile.readline(65536)  # trailing CRLF
-                        return data
+                        return bytes(data)
                     remaining = size
                     while remaining > 0:
                         part = self.rfile.read(min(remaining, 65536))
                         if not part:
-                            return data
-                        data += part
+                            return bytes(data)
+                        data.extend(part)
                         remaining -= len(part)
                         if len(data) > limit:
                             raise BodyTooLargeError()
@@ -246,13 +310,13 @@ def make_handler(app):
             length = int(self.headers.get("Content-Length") or 0)
             if length > limit:
                 raise BodyTooLargeError()
-            data = b""
+            data = bytearray()
             while len(data) < length:
                 part = self.rfile.read(length - len(data))
                 if not part:
                     break
-                data += part
-            return data
+                data.extend(part)
+            return bytes(data)
 
         # ------------------------------------------------ auth
 
@@ -360,7 +424,18 @@ def make_handler(app):
                 self._send_error_json(400, "request body is not valid JSON")
                 return
             try:
-                with app.semaphore:
+                if app.queue_wait_sec > 0:
+                    if not app.semaphore.acquire(timeout=app.queue_wait_sec):
+                        self._send_json(
+                            {"error": {
+                                "message": ("server busy: all upstream slots in use, "
+                                            "retry after a short pause"),
+                                "type": "rate_limit_error", "code": "server_busy"}},
+                            429, headers={"Retry-After": str(int(max(app.queue_wait_sec, 1)))})
+                        return
+                else:
+                    app.semaphore.acquire()  # legacy: wait indefinitely
+                try:
                     if path == "/v1/chat/completions":
                         self._chat_completions(data)
                     elif path == "/v1/responses":
@@ -376,6 +451,8 @@ def make_handler(app):
                             self._send_error_json(404, f"unknown action :{action}")
                     else:
                         self._send_error_json(404, f"not found: {path}")
+                finally:
+                    app.semaphore.release()
             except PromptError as exc:
                 self._fail(400, str(exc))
             except UploadError as exc:
@@ -418,6 +495,7 @@ def make_handler(app):
             model_info = self._resolve_model_or_error(data.get("model"))
             if model_info is None:
                 return
+            model_info = apply_reasoning_effort(model_info, data.get("reasoning_effort"))
             messages = data.get("messages") or []
             if not messages:
                 self._send_error_json(400, "messages[] is required")
@@ -469,11 +547,9 @@ def make_handler(app):
                 return
 
             if wants_stream:
+                # headers + role chunk go out immediately — the client sees a
+                # live stream instead of blocking on the first upstream token
                 gen = app.gemini.stream_events(prompt, file_refs, model_info)
-                try:
-                    first = next(gen)
-                except StopIteration:
-                    first = None
                 self._start_stream("text/event-stream; charset=utf-8")
                 self._sse(_chat_chunk(cid, created, model_info.name,
                                       {"role": "assistant", "content": ""}))
@@ -489,10 +565,13 @@ def make_handler(app):
                         self._sse(_chat_chunk(cid, created, model_info.name,
                                               {"content": delta}))
 
-                if first is not None:
-                    _emit(first)
-                for event in gen:
-                    _emit(event)
+                try:
+                    for event in gen:
+                        _emit(event)
+                except GeminiError as exc:
+                    # upstream failed after the stream opened — surface in-band
+                    self._sse_stream_error(exc)
+                    return
                 text = "".join(pieces)
                 final = _chat_chunk(cid, created, model_info.name, {}, "stop")
                 final["usage"] = _usage(prompt, text)
@@ -521,6 +600,9 @@ def make_handler(app):
             model_info = self._resolve_model_or_error(data.get("model"))
             if model_info is None:
                 return
+            reasoning = data.get("reasoning")
+            effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+            model_info = apply_reasoning_effort(model_info, effort)
             messages = responses_input_to_messages(data.get("input"),
                                                    data.get("instructions"))
             tools = normalize_tools(data.get("tools"))
@@ -557,24 +639,15 @@ def make_handler(app):
                 return
 
             gen = app.gemini.stream_generate(prompt, file_refs, model_info)
-            try:
-                first = next(gen)
-            except StopIteration:
-                first = None
             if data.get("stream"):
-                self._stream_responses_text(rid, created, model_info.name, prompt,
-                                            gen, first)
+                self._stream_responses_text(rid, created, model_info.name, prompt, gen)
             else:
-                pieces = []
-                if first is not None:
-                    pieces.append(first)
-                pieces.extend(gen)
-                text = "".join(pieces)
+                text = "".join(gen)
                 self._send_json(_resp_object(
                     rid, created, model_info.name,
                     [_resp_message_item(text)] if text else [], prompt, text))
 
-        def _stream_responses_text(self, rid, created, model, prompt, gen, first):
+        def _stream_responses_text(self, rid, created, model, prompt, gen):
             msg_id = "msg_" + uuid.uuid4().hex[:24]
             seq = [0]
 
@@ -597,16 +670,18 @@ def make_handler(app):
                {"item_id": msg_id, "output_index": 0, "content_index": 0, "part": part})
 
             pieces = []
-            if first is not None:
-                pieces.append(first)
-                ev("response.output_text.delta",
-                   {"item_id": msg_id, "output_index": 0, "content_index": 0,
-                    "delta": first, "logprobs": []})
-            for delta in gen:
-                pieces.append(delta)
-                ev("response.output_text.delta",
-                   {"item_id": msg_id, "output_index": 0, "content_index": 0,
-                    "delta": delta, "logprobs": []})
+            try:
+                for delta in gen:
+                    pieces.append(delta)
+                    ev("response.output_text.delta",
+                       {"item_id": msg_id, "output_index": 0, "content_index": 0,
+                        "delta": delta, "logprobs": []})
+            except GeminiError as exc:
+                ev("response.failed",
+                   {"response": {"id": rid, "object": "response", "status": "failed",
+                                 "error": {"message": str(exc),
+                                           "type": "upstream_error"}}})
+                return
             text = "".join(pieces)
 
             ev("response.output_text.done",
@@ -657,6 +732,14 @@ def make_handler(app):
             model_info = self._resolve_model_or_error(model)
             if model_info is None:
                 return
+            gen_config = data.get("generationConfig") or data.get("generation_config") or {}
+            think_cfg = (gen_config.get("thinkingConfig")
+                         or gen_config.get("thinking_config") or {})
+            budget = (think_cfg.get("thinkingBudget")
+                      if think_cfg.get("thinkingBudget") is not None
+                      else think_cfg.get("thinking_budget"))
+            if budget is not None:
+                model_info = apply_thinking_budget(model_info, budget)
             contents = data.get("contents") or []
             si = data.get("systemInstruction") or data.get("system_instruction")
             tools_raw = data.get("tools")
@@ -715,21 +798,21 @@ def make_handler(app):
                                 else "application/x-ndjson")
                 self._start_stream(content_type)
                 gen = app.gemini.stream_generate(prompt, file_refs, model_info)
-                try:
-                    first = next(gen)
-                except StopIteration:
-                    first = None
-                pieces = []
-                if first is not None:
-                    pieces.append(first)
-                    emit({"candidates": [{"content": {"parts": [{"text": first}],
-                                                      "role": "model"}, "index": 0}],
-                          "modelVersion": model_info.name})
-                for delta in gen:
-                    pieces.append(delta)
+
+                def emit_delta(delta):
                     emit({"candidates": [{"content": {"parts": [{"text": delta}],
                                                       "role": "model"}, "index": 0}],
                           "modelVersion": model_info.name})
+
+                pieces = []
+                try:
+                    for delta in gen:
+                        pieces.append(delta)
+                        emit_delta(delta)
+                except GeminiError as exc:
+                    emit({"error": {"code": 502, "message": str(exc),
+                                    "status": "UPSTREAM_ERROR"}})
+                    return
                 text = "".join(pieces)
                 emit({"candidates": [{"content": {"parts": [], "role": "model"},
                                       "finishReason": "STOP", "index": 0}],
@@ -751,18 +834,22 @@ def serve(config):
     """Blocking entrypoint: builds the app, starts the HTTP server, serves forever."""
     app = App(config)
     handler = make_handler(app)
-    server = ThreadingHTTPServer((config.host, config.port), handler)
-    server.daemon_threads = True
+    server = PoolHTTPServer((config.host, config.port), handler,
+                            pool_workers=max(8, int(getattr(config, "pool_workers", 64))))
     threading.Thread(target=app.warmup, daemon=True).start()
     threading.Thread(target=app.state_refresher, daemon=True).start()
 
     auth = "API key" if config.api_keys else "open (no auth)"
     print(f"gemini-web2api v{__version__} listening on http://{config.host}:{config.port}")
     print(f"  endpoints : /v1/chat/completions, /v1/responses, /v1beta/models/*, /v1/models")
+    print(f"  reasoning : reasoning_effort=off|low|medium|high|max or model@think=off..max")
     print(f"  default   : {config.default_model} | auth: {auth}"
           + (" | cookie: yes" if config.cookie_file else " | cookie: no (anonymous)"))
     try:
-        server.serve_forever()
+        # 50ms selector wakeup instead of the 500ms default: a fresh client
+        # connection is accepted (and its SSE headers flushed) within a few
+        # tens of ms even when it arrives between polls
+        server.serve_forever(poll_interval=0.05)
     except KeyboardInterrupt:
         pass
     finally:

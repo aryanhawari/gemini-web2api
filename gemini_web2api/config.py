@@ -16,8 +16,8 @@ LOCAL_CONFIG = "config.json"
 USER_CONFIG = os.path.join("~", ".config", "gemini-web2api", "config.json")
 
 INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "auth_user",
-              "state_refresh_sec"}
-FLOAT_FIELDS = {"retry_delay_sec"}
+              "state_refresh_sec", "pool_workers"}
+FLOAT_FIELDS = {"retry_delay_sec", "queue_wait_sec"}
 BOOL_FIELDS = {"log_requests", "temporary_chats"}
 
 
@@ -40,6 +40,8 @@ class Config:
     temporary_chats: bool = False            # true = history not saved on the account
     state_refresh_sec: int = 300             # background bl/xsrf refresh cadence (0 = off)
     max_concurrent_requests: int = 8         # upstream concurrency cap
+    queue_wait_sec: float = 30.0             # max wait for a free slot before 429 (0 = forever)
+    pool_workers: int = 64                   # HTTP worker threads serving connections
     max_body_mb: float = 10.0                # request body size limit
     strict_models: bool = True               # unknown model name -> 400 (else fallback)
 
@@ -100,9 +102,11 @@ def _apply_env_overrides(cfg: Config, env: dict) -> None:
         cfg.request_timeout_sec = int(env["REQUEST_TIMEOUT_SEC"])
     if env.get("MAX_CONCURRENT_REQUESTS", "").strip().isdigit():
         cfg.max_concurrent_requests = int(env["MAX_CONCURRENT_REQUESTS"])
+    if env.get("POOL_WORKERS", "").strip().isdigit():
+        cfg.pool_workers = int(env["POOL_WORKERS"])
     if env.get("PORT", "").strip().isdigit():
         cfg.port = int(env["PORT"])
-    for name in ("RETRY_DELAY_SEC", "MAX_BODY_MB"):
+    for name in ("RETRY_DELAY_SEC", "MAX_BODY_MB", "QUEUE_WAIT_SEC"):
         raw = env.get(name, "").strip()
         if raw:
             try:
