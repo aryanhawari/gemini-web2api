@@ -48,6 +48,14 @@ try:
 except ImportError:  # pragma: no cover - curl_cffi optional but needed for images
     HAVE_CURL_CFFI = False
 
+try:
+    import h2  # noqa: F401  # type: ignore
+    HAVE_H2 = True
+except ImportError:  # pragma: no cover - h2 optional; HTTP/2 only when present
+    HAVE_H2 = False
+
+KEEPALIVE_EXPIRY_SEC = 600  # hold pooled TLS connections far beyond httpx's 5s default
+
 
 class GeminiError(RuntimeError):
     """Fatal upstream/protocol error."""
@@ -341,6 +349,7 @@ class GeminiClient:
         self._curl_client = None
         self._bl_lock = threading.Lock()
         self._xsrf_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._xsrf = config.xsrf_token
 
     # -- low-level HTTP ----------------------------------------------------
@@ -363,11 +372,19 @@ class GeminiClient:
         return bool(file_refs) and self._curl() is not None
 
     def _http(self):
-        """Shared httpx client (None when httpx is not installed)."""
+        """Shared httpx client (None when httpx is not installed).
+
+        HTTP/2 is enabled when the h2 package is available (fewer handshakes
+        under concurrency); keep-alive expiry is raised from httpx's 5s
+        default so an idle minute between chats does not cost a fresh
+        TCP+TLS handshake.
+        """
         if self._http_client is None and HAVE_HTTPX:
             common = dict(
                 timeout=self.cfg.request_timeout_sec,
                 follow_redirects=True,
+                http2=HAVE_H2,
+                limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
                 headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
             )
             if self.cfg.proxy:
@@ -419,14 +436,30 @@ class GeminiClient:
             return resp.text
         return self._urllib_request("GET", url)
 
+    def refresh_state(self):
+        """One /app fetch refreshes the build label AND the xsrf token.
+
+        Both are embedded in the same page, so a combined fetch halves the
+        warmup/refresh cost versus a bl-only fetch followed by an xsrf fetch.
+        Raises GeminiError when no build label is found (page layout change).
+        """
+        with self._state_lock:
+            html = self.fetch_page("/app")
+            label = extract_build_label(html)
+            if not label:
+                raise GeminiError(
+                    "Could not extract build label (cfb2h / boq_*) from "
+                    "gemini.google.com/app — page layout may have changed.")
+            self.cfg.gemini_bl = label
+            if self.cookies and self.cookies.get()[0]:
+                match = SNLM0E_RE.search(html)
+                if match:
+                    with self._xsrf_lock:
+                        self._xsrf = match.group(1)
+            return label
+
     def refresh_bl(self):
-        html = self.fetch_page("/app")
-        label = extract_build_label(html)
-        if not label:
-            raise GeminiError(
-                "Could not extract build label (cfb2h / boq_*) from "
-                "gemini.google.com/app — page layout may have changed.")
-        self.cfg.gemini_bl = label
+        self.cfg.gemini_bl = self.refresh_state()
         return self.cfg.gemini_bl
 
     def ensure_bl(self):
@@ -434,7 +467,7 @@ class GeminiClient:
             return self.cfg.gemini_bl
         with self._bl_lock:
             if not self.cfg.gemini_bl:
-                self.refresh_bl()
+                self.refresh_state()
             return self.cfg.gemini_bl
 
     def get_xsrf(self, force=False):
@@ -572,7 +605,8 @@ class GeminiClient:
         inner = build_inner(prompt, file_refs or [], model_info,
                             temporary_chats=self.cfg.temporary_chats)
         last = None
-        for attempt in range(max(1, self.cfg.retry_attempts)):
+        attempts = max(1, self.cfg.retry_attempts)
+        for attempt in range(attempts):
             try:
                 if use_curl:
                     body = self._post_once_curl(inner)
@@ -585,7 +619,8 @@ class GeminiClient:
             except (RetryableError, RateLimitedError, GeminiError) as exc:
                 last = exc
                 self._recover(exc)
-            time.sleep(self._backoff(attempt, last))
+                if attempt < attempts - 1:
+                    time.sleep(self._backoff(attempt, last))
         raise last
 
     def stream_events(self, prompt, file_refs=None, model_info=None):
@@ -607,7 +642,8 @@ class GeminiClient:
         inner = build_inner(prompt, file_refs or [], model_info,
                             temporary_chats=self.cfg.temporary_chats)
         last = None
-        for attempt in range(max(1, self.cfg.retry_attempts)):
+        attempts = max(1, self.cfg.retry_attempts)
+        for attempt in range(attempts):
             text_emitted = False
             try:
                 for kind, delta in iter_events(self._post_stream_once(inner)):
@@ -622,7 +658,8 @@ class GeminiClient:
                 if text_emitted:
                     raise
                 self._recover(exc)
-            time.sleep(self._backoff(attempt, last))
+                if attempt < attempts - 1:
+                    time.sleep(self._backoff(attempt, last))
         raise last
 
     def stream_generate(self, prompt, file_refs=None, model_info=None):

@@ -15,7 +15,8 @@ ENV_CONFIG_VAR = "GEMINI_WEB2API_CONFIG"
 LOCAL_CONFIG = "config.json"
 USER_CONFIG = os.path.join("~", ".config", "gemini-web2api", "config.json")
 
-INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "auth_user"}
+INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "auth_user",
+              "state_refresh_sec"}
 FLOAT_FIELDS = {"retry_delay_sec"}
 BOOL_FIELDS = {"log_requests", "temporary_chats"}
 
@@ -37,6 +38,7 @@ class Config:
     proxy: Optional[str] = None              # e.g. http://127.0.0.1:7890
     log_requests: bool = True
     temporary_chats: bool = False            # true = history not saved on the account
+    state_refresh_sec: int = 300             # background bl/xsrf refresh cadence (0 = off)
     max_concurrent_requests: int = 8         # upstream concurrency cap
     max_body_mb: float = 10.0                # request body size limit
     strict_models: bool = True               # unknown model name -> 400 (else fallback)
@@ -92,6 +94,8 @@ def _apply_env_overrides(cfg: Config, env: dict) -> None:
 
     if env.get("RETRY_ATTEMPTS", "").strip().isdigit():
         cfg.retry_attempts = int(env["RETRY_ATTEMPTS"])
+    if env.get("STATE_REFRESH_SEC", "").strip().isdigit():
+        cfg.state_refresh_sec = int(env["STATE_REFRESH_SEC"])
     if env.get("REQUEST_TIMEOUT_SEC", "").strip().isdigit():
         cfg.request_timeout_sec = int(env["REQUEST_TIMEOUT_SEC"])
     if env.get("MAX_CONCURRENT_REQUESTS", "").strip().isdigit():

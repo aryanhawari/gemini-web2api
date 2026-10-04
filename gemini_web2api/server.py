@@ -60,11 +60,30 @@ class App:
                 self.image_engine = None
 
     def warmup(self):
-        """Prefetch the build label in the background; never fatal."""
+        """Prefetch build label + xsrf token in the background; never fatal.
+
+        Both live on the same /app page, so this single fetch also leaves a
+        warm TLS connection in the pool for the first real request.
+        """
         try:
             self.gemini.ensure_bl()
         except GeminiError as exc:
             self._warn(f"build-label prefetch failed: {exc}")
+
+    def state_refresher(self):
+        """Periodically re-fetches build label + xsrf so requests never pay
+        the 405/400 recovery path (page fetch + full retry), and keeps a
+        pooled connection warm. Runs until process exit; failures are quiet
+        (stale state keeps working until upstream actually rejects it)."""
+        interval = max(0, int(getattr(self.config, "state_refresh_sec", 300)))
+        if not interval:
+            return
+        while True:
+            time.sleep(interval)
+            try:
+                self.gemini.refresh_state()
+            except Exception:
+                pass
 
     @staticmethod
     def _warn(message):
@@ -156,6 +175,9 @@ def make_handler(app):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Nagle off: small SSE chunks flush immediately instead of waiting on
+        # delayed-ACK interaction (visible per-chunk latency on Windows)
+        disable_nagle_algorithm = True
         server_version = f"gemini-web2api/{__version__}"
         _response_started = False
 
@@ -732,6 +754,7 @@ def serve(config):
     server = ThreadingHTTPServer((config.host, config.port), handler)
     server.daemon_threads = True
     threading.Thread(target=app.warmup, daemon=True).start()
+    threading.Thread(target=app.state_refresher, daemon=True).start()
 
     auth = "API key" if config.api_keys else "open (no auth)"
     print(f"gemini-web2api v{__version__} listening on http://{config.host}:{config.port}")
