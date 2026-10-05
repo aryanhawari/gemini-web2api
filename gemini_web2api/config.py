@@ -16,17 +16,25 @@ LOCAL_CONFIG = "config.json"
 USER_CONFIG = os.path.join("~", ".config", "gemini-web2api", "config.json")
 
 INT_FIELDS = {"port", "retry_attempts", "request_timeout_sec", "auth_user",
-              "state_refresh_sec", "pool_workers"}
-FLOAT_FIELDS = {"retry_delay_sec", "queue_wait_sec"}
-BOOL_FIELDS = {"log_requests", "temporary_chats"}
+              "state_refresh_sec", "pool_workers", "pool_queue_depth",
+              "min_concurrent_requests", "initial_concurrent_requests",
+              "max_concurrent_requests", "hedge_max_inflight",
+              "agents_express", "agents_standard", "agents_heavy",
+              "agent_queue_depth", "lane_express_chars", "lane_heavy_chars"}
+FLOAT_FIELDS = {"retry_delay_sec", "queue_wait_sec", "request_deadline_sec",
+                "first_byte_timeout_sec", "stream_read_timeout_sec",
+                "hedge_after_sec", "max_retry_wait_sec", "sse_keepalive_sec",
+                "latency_target_sec", "agent_submit_wait_sec"}
+BOOL_FIELDS = {"log_requests", "temporary_chats", "adaptive_concurrency",
+               "agents_enabled"}
 
 
 @dataclass
 class Config:
     port: int = 8000
     host: str = "0.0.0.0"
-    retry_attempts: int = 3
-    retry_delay_sec: float = 2.0
+    retry_attempts: int = 2
+    retry_delay_sec: float = 1.0
     request_timeout_sec: int = 180
     gemini_bl: Optional[str] = None          # auto-refreshed at runtime
     auth_user: Optional[int] = None          # /u/N/ account index
@@ -39,27 +47,113 @@ class Config:
     log_requests: bool = True
     temporary_chats: bool = False            # true = history not saved on the account
     state_refresh_sec: int = 300             # background bl/xsrf refresh cadence (0 = off)
-    max_concurrent_requests: int = 8         # upstream concurrency cap
-    queue_wait_sec: float = 30.0             # max wait for a free slot before 429 (0 = forever)
-    pool_workers: int = 64                   # HTTP worker threads serving connections
+
+    # -- concurrency / admission control -----------------------------------
+    max_concurrent_requests: int = 32        # hard cap on in-flight upstream calls
+    min_concurrent_requests: int = 2         # AIMD floor
+    initial_concurrent_requests: int = 32    # start at the permitted cap; AIMD shrinks on pressure
+    adaptive_concurrency: bool = True        # False = fixed initial limit
+    hedge_max_inflight: int = 2              # global cap on tail-latency hedge calls
+    queue_wait_sec: float = 5.0              # max wait for a slot before 429 (0 = forever)
+    pool_workers: int = 128                  # HTTP worker threads serving connections
+    pool_queue_depth: int = 1024             # accepted-but-not-yet-served connections
+
+    # -- agent fleet (parallel lane-scheduled upstream executors) ----------
+    agents_enabled: bool = True              # False = run requests inline (legacy)
+    agents_express: int = 6                  # agents reserved for small/fast requests
+    agents_standard: int = 20                # agents for normal traffic
+    agents_heavy: int = 6                    # agents for images / tools / big payloads
+    agent_queue_depth: int = 256             # max queued jobs per lane before 429
+    agent_submit_wait_sec: float = 5.0       # max wait for a lane slot (0 = forever)
+    lane_express_chars: int = 4000           # body bytes <= this -> express lane
+    lane_heavy_chars: int = 60000            # body bytes >= this -> heavy lane
+
+    # -- latency guards -----------------------------------------------------
+    request_deadline_sec: float = 75.0       # whole-call budget incl. retries (0 = off)
+    first_byte_timeout_sec: float = 15.0     # abort a stream with no upstream byte (0 = off)
+    stream_read_timeout_sec: float = 30.0    # max silence between streamed events
+    hedge_after_sec: float = 3.5             # race a 2nd attempt if silent this long (0 = off)
+    max_retry_wait_sec: float = 3.0          # never sleep longer than this inside a slot
+    sse_keepalive_sec: float = 15.0          # SSE keep-alive comment cadence (0 = off)
+    latency_target_sec: float = 7.0          # health/reporting target (not a hard cap)
+
     max_body_mb: float = 10.0                # request body size limit
     strict_models: bool = True               # unknown model name -> 400 (else fallback)
 
     def __post_init__(self):
         if self.api_keys is None:
             self.api_keys = []
+        # keep the admission-control range sane whatever the config file says
+        self.max_concurrent_requests = max(1, int(self.max_concurrent_requests or 1))
+        self.min_concurrent_requests = max(
+            1, min(int(self.min_concurrent_requests or 1), self.max_concurrent_requests))
+        self.initial_concurrent_requests = max(
+            self.min_concurrent_requests,
+            min(int(self.initial_concurrent_requests or self.min_concurrent_requests),
+                self.max_concurrent_requests))
+        self.pool_workers = max(8, int(self.pool_workers or 8))
+        self.pool_queue_depth = max(1, int(self.pool_queue_depth or 1))
+        # agent fleet: counts are clamped so a bad config can never crash startups
+        self.agents_express = max(0, int(self.agents_express or 0))
+        self.agents_standard = max(0, int(self.agents_standard or 0))
+        self.agents_heavy = max(0, int(self.agents_heavy or 0))
+        self.agent_queue_depth = max(1, int(self.agent_queue_depth or 1))
+        self.agent_submit_wait_sec = max(0.0, float(self.agent_submit_wait_sec or 0.0))
+        self.lane_express_chars = max(1, int(self.lane_express_chars or 1))
+        self.lane_heavy_chars = max(self.lane_express_chars,
+                                    int(self.lane_heavy_chars or self.lane_express_chars))
 
 
 _CONFIG_FIELDS = {f.name for f in fields(Config)}
 
 ENV_LIST_FIELDS = {"api_keys"}
 
+# env var -> config field maps (string env values are parsed per type)
+_INT_ENV = {
+    "RETRY_ATTEMPTS": "retry_attempts",
+    "STATE_REFRESH_SEC": "state_refresh_sec",
+    "REQUEST_TIMEOUT_SEC": "request_timeout_sec",
+    "MAX_CONCURRENT_REQUESTS": "max_concurrent_requests",
+    "MIN_CONCURRENT_REQUESTS": "min_concurrent_requests",
+    "INITIAL_CONCURRENT_REQUESTS": "initial_concurrent_requests",
+    "HEDGE_MAX_INFLIGHT": "hedge_max_inflight",
+    "POOL_WORKERS": "pool_workers",
+    "POOL_QUEUE_DEPTH": "pool_queue_depth",
+    "AGENTS_EXPRESS": "agents_express",
+    "AGENTS_STANDARD": "agents_standard",
+    "AGENTS_HEAVY": "agents_heavy",
+    "AGENT_QUEUE_DEPTH": "agent_queue_depth",
+    "LANE_EXPRESS_CHARS": "lane_express_chars",
+    "LANE_HEAVY_CHARS": "lane_heavy_chars",
+    "PORT": "port",
+}
+_FLOAT_ENV = {
+    "RETRY_DELAY_SEC": "retry_delay_sec",
+    "MAX_BODY_MB": "max_body_mb",
+    "QUEUE_WAIT_SEC": "queue_wait_sec",
+    "REQUEST_DEADLINE_SEC": "request_deadline_sec",
+    "FIRST_BYTE_TIMEOUT_SEC": "first_byte_timeout_sec",
+    "STREAM_READ_TIMEOUT_SEC": "stream_read_timeout_sec",
+    "HEDGE_AFTER_SEC": "hedge_after_sec",
+    "MAX_RETRY_WAIT_SEC": "max_retry_wait_sec",
+    "SSE_KEEPALIVE_SEC": "sse_keepalive_sec",
+    "LATENCY_TARGET_SEC": "latency_target_sec",
+    "AGENT_SUBMIT_WAIT_SEC": "agent_submit_wait_sec",
+}
+_BOOL_ENV = {
+    "TEMPORARY_CHATS": "temporary_chats",
+    "ADAPTIVE_CONCURRENCY": "adaptive_concurrency",
+    "LOG_REQUESTS": "log_requests",
+    "AGENTS_ENABLED": "agents_enabled",
+}
+_FALSEY = {"0", "false", "no", "off", "none", ""}
+
 
 def load_env_file(path=".env"):
     """Parses a .env file (KEY=VALUE lines, # comments, optional quotes). -> dict."""
     env = {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -94,25 +188,23 @@ def _apply_env_overrides(cfg: Config, env: dict) -> None:
         if not cfg.cookie_file:
             cfg.cookie_file = None  # env cookie wins when no file configured
 
-    if env.get("RETRY_ATTEMPTS", "").strip().isdigit():
-        cfg.retry_attempts = int(env["RETRY_ATTEMPTS"])
-    if env.get("STATE_REFRESH_SEC", "").strip().isdigit():
-        cfg.state_refresh_sec = int(env["STATE_REFRESH_SEC"])
-    if env.get("REQUEST_TIMEOUT_SEC", "").strip().isdigit():
-        cfg.request_timeout_sec = int(env["REQUEST_TIMEOUT_SEC"])
-    if env.get("MAX_CONCURRENT_REQUESTS", "").strip().isdigit():
-        cfg.max_concurrent_requests = int(env["MAX_CONCURRENT_REQUESTS"])
-    if env.get("POOL_WORKERS", "").strip().isdigit():
-        cfg.pool_workers = int(env["POOL_WORKERS"])
-    if env.get("PORT", "").strip().isdigit():
-        cfg.port = int(env["PORT"])
-    for name in ("RETRY_DELAY_SEC", "MAX_BODY_MB", "QUEUE_WAIT_SEC"):
-        raw = env.get(name, "").strip()
+    for env_name, field in _INT_ENV.items():
+        raw = str(env.get(env_name, "")).strip()
+        if raw.isdigit():
+            setattr(cfg, field, int(raw))
+    for env_name, field in _FLOAT_ENV.items():
+        raw = str(env.get(env_name, "")).strip()
         if raw:
             try:
-                setattr(cfg, name.lower(), float(raw))
+                setattr(cfg, field, float(raw))
             except ValueError:
                 pass
+    for env_name, field in _BOOL_ENV.items():
+        raw = str(env.get(env_name, "")).strip().lower()
+        if raw:
+            setattr(cfg, field, raw not in _FALSEY)
+    # re-normalize the AIMD range after env overrides
+    cfg.__post_init__()
 
 
 def _apply(cfg: Config, data: dict) -> None:
@@ -132,9 +224,15 @@ def _apply(cfg: Config, data: dict) -> None:
             except (TypeError, ValueError):
                 pass
         elif key in BOOL_FIELDS:
-            setattr(cfg, key, bool(value))
+            # JSON booleans pass through; the strings "false"/"0"/"no"/"off"
+            # must disable (bool("false") is True — a silent config trap)
+            if isinstance(value, bool):
+                setattr(cfg, key, value)
+            else:
+                setattr(cfg, key, str(value).strip().lower() not in _FALSEY)
         else:
             setattr(cfg, key, str(value))
+    cfg.__post_init__()
 
 
 def find_config(explicit: Optional[str] = None) -> Optional[str]:
@@ -153,7 +251,7 @@ def load_config(explicit: Optional[str] = None) -> Config:
     cfg = Config()
     path = find_config(explicit)
     if path and os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             _apply(cfg, json.load(fh))
         cfg.config_path = path
     env = dict(os.environ)
@@ -184,6 +282,7 @@ def apply_args(cfg: Config, args) -> Config:
         cfg.cookie_file = args.cookie_file
     if getattr(args, "proxy", None):
         cfg.proxy = args.proxy
+    cfg.__post_init__()
     return cfg
 
 

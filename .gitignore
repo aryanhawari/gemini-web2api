@@ -14,3 +14,6 @@ auth_server.log
 auth_test_config.json
 server.log
 railway_login.log
+
+# tool artifacts
+.freebuff/

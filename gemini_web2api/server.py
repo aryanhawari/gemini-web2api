@@ -16,6 +16,9 @@ x-goog-api-key or ?key= against config.api_keys (empty list = open).
 Latency/stability notes:
   - SSE headers flush immediately; upstream events forward as they arrive
   - bounded worker pool + bounded queue shed overload cleanly (429/Retry-After)
+  - lane-scheduled agent fleet executes upstream calls in parallel: express
+    agents keep small chat requests fast while heavy image/tool requests run
+    on their own agents, and a supervisor revives crashed agents
   - reasoning effort (off/low/medium/high/max) maps to upstream thinking depth
 """
 
@@ -30,7 +33,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
-from .gemini import GeminiError, RateLimitedError
+from .agents import AgentError, PoolBusy, build_pool
+from .agents import classify as classify_lane
+from .gemini import (GeminiError, RateLimitedError, RetryableError,
+                     UpstreamTimeoutError)
+from .limiter import AdaptiveConcurrency
 from .models import (THINK_SUFFIX_RE, apply_reasoning_effort, apply_thinking_budget,
                      is_known_model, list_model_infos, resolve_model)
 from .multimodal import UploadError, detect_image_mime, make_file_name
@@ -52,7 +59,7 @@ class PoolHTTPServer(HTTPServer):
     """
 
     # accept backlog for bursty connection storms
-    request_queue_size = 128
+    request_queue_size = 512
 
     def __init__(self, address, handler, pool_workers=64, queue_depth=512):
         super().__init__(address, handler)
@@ -80,8 +87,24 @@ class PoolHTTPServer(HTTPServer):
         try:
             self._tasks.put_nowait((request, client_address))
         except queue.Full:
-            # saturated: refuse fast instead of buffering unbounded work
+            # saturated: answer with a real 503 + Retry-After instead of a
+            # silent connection drop (clients otherwise retry-storm instantly)
+            self._reject_overloaded(request)
             self.shutdown_request(request)
+
+    @staticmethod
+    def _reject_overloaded(request):
+        body = (b'{"error":{"message":"server overloaded: request queue is full",'
+                b'"type":"rate_limit_error","code":"overloaded"}}')
+        head = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Retry-After: 1\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+        try:
+            request.sendall(head + body)
+        except OSError:
+            pass
 
 
 class App:
@@ -89,19 +112,48 @@ class App:
 
     def __init__(self, config, gemini=None, uploader=None, image_engine=True):
         self.config = config
+        self.limiter = AdaptiveConcurrency(
+            initial=getattr(config, "initial_concurrent_requests",
+                            getattr(config, "max_concurrent_requests", 8)),
+            minimum=getattr(config, "min_concurrent_requests", 1),
+            maximum=getattr(config, "max_concurrent_requests", 8),
+            adaptive=getattr(config, "adaptive_concurrency", True),
+            latency_target_sec=getattr(config, "latency_target_sec", 0.0),
+        )
+        # Backwards-compatible name: existing call sites talk to app.semaphore.
+        # It is now an AIMD gate, not a fixed threading semaphore.
+        self.semaphore = self.limiter
+        # Parallel agent fleet: every POST route executes its upstream work on
+        # a lane-bound agent thread (None = legacy inline execution).
+        self.agents = build_pool(config)
+        self.agent_submit_wait_sec = max(
+            0.0, float(getattr(config, "agent_submit_wait_sec", 0) or 0))
+        self.lane_express_chars = int(getattr(config, "lane_express_chars", 4000) or 4000)
+        self.lane_heavy_chars = int(getattr(config, "lane_heavy_chars", 60000) or 60000)
         if gemini is None:
             from .gemini import GeminiClient
             gemini = GeminiClient(config)
+        try:
+            gemini.limiter = self.limiter  # enables capacity-aware hedging
+        except Exception:
+            pass
         if uploader is None:
             from .multimodal import ImageUploader
             uploader = ImageUploader(gemini)
         self.gemini = gemini
         self.uploader = uploader
-        self.semaphore = threading.BoundedSemaphore(
-            max(1, int(config.max_concurrent_requests)))
         # max seconds a request may wait for a free upstream slot before a
         # 429 + Retry-After is returned (0 = wait forever, legacy behavior)
         self.queue_wait_sec = max(0.0, float(getattr(config, "queue_wait_sec", 0) or 0))
+        self._metrics_lock = threading.Lock()
+        self.requests_total = 0
+        self.requests_failed = 0
+        self._latency_samples = 0
+        self._queue_ewma = 0.0
+        self._ttfb_ewma = 0.0
+        self._total_ewma = 0.0
+        self._last_queue_wait_ms = 0.0
+        self._last_total_ms = 0.0
         self.image_engine = None
         if image_engine is True:
             try:
@@ -115,12 +167,13 @@ class App:
         """Prefetch build label + xsrf token in the background; never fatal.
 
         Both live on the same /app page, so this single fetch also leaves a
-        warm TLS connection in the pool for the first real request.
+        warm TLS connection in the pool for the first real request, and no
+        live request ever pays the state-fetch round-trip.
         """
         try:
-            self.gemini.ensure_bl()
+            self.gemini.refresh_state()
         except GeminiError as exc:
-            self._warn(f"build-label prefetch failed: {exc}")
+            self._warn(f"state prefetch failed: {exc}")
 
     def state_refresher(self):
         """Periodically re-fetches build label + xsrf so requests never pay
@@ -140,6 +193,57 @@ class App:
     @staticmethod
     def _warn(message):
         sys.stderr.write(f"[gemini-web2api] WARN {message}\n")
+
+    def note_request(self, queue_wait_ms=0.0, ttfb_ms=None, total_ms=0.0, ok=True):
+        """Records one client request for the /health latency snapshot."""
+        alpha = 0.2
+        ttfb_ms = float(total_ms if ttfb_ms is None else ttfb_ms)
+        with self._metrics_lock:
+            self.requests_total += 1
+            if not ok:
+                self.requests_failed += 1
+            self._last_queue_wait_ms = float(queue_wait_ms)
+            self._last_total_ms = float(total_ms)
+            if not self._latency_samples:
+                self._queue_ewma = float(queue_wait_ms)
+                self._ttfb_ewma = ttfb_ms
+                self._total_ewma = float(total_ms)
+            else:
+                self._queue_ewma = (1 - alpha) * self._queue_ewma + alpha * queue_wait_ms
+                self._ttfb_ewma = (1 - alpha) * self._ttfb_ewma + alpha * ttfb_ms
+                self._total_ewma = (1 - alpha) * self._total_ewma + alpha * total_ms
+            self._latency_samples += 1
+
+    def load_snapshot(self):
+        """Live load + latency state for /health and operators."""
+        snapshot = self.limiter.describe()
+        with self._metrics_lock:
+            snapshot.update({
+                "requests": self.requests_total,
+                "failures": self.requests_failed,
+                "queue_wait_ms": round(self._queue_ewma, 1),
+                "last_queue_wait_ms": round(self._last_queue_wait_ms, 1),
+                "ttfb_ms": round(self._ttfb_ewma, 1),
+                "latency_ms": round(self._total_ewma, 1),
+                "last_latency_ms": round(self._last_total_ms, 1),
+            })
+        snapshot["queue_wait_sec"] = round(self.queue_wait_sec, 3)
+        snapshot["latency_target_ms"] = int(
+            float(getattr(self.config, "latency_target_sec", 0) or 0) * 1000)
+        snapshot["agents"] = (self.agents.describe() if self.agents is not None
+                              else {"enabled": False})
+        return snapshot
+
+    def lane_for(self, data, body_len):
+        """Routes one parsed request body to an agent lane (express/standard/heavy)."""
+        return classify_lane(body_len, data,
+                             express_chars=self.lane_express_chars,
+                             heavy_chars=self.lane_heavy_chars)
+
+    def shutdown(self):
+        """Stops the agent fleet (embedded use / clean process exit)."""
+        if self.agents is not None:
+            self.agents.stop()
 
     def upload_images(self, images):
         """image specs -> [ref, filename] pairs for the payload. Raises UploadError (-> 502)."""
@@ -238,6 +342,14 @@ def make_handler(app):
 
         # ------------------------------------------------ plumbing
 
+        def setup(self):
+            super().setup()
+            self._sse_lock = threading.Lock()
+            self._stream_stop = threading.Event()
+            self._first_byte_ts = None
+            self._keepalive_thread = None
+            self._upstream_error = None
+
         def log_message(self, fmt, *args):
             if app.config.log_requests:
                 sys.stderr.write("[{}] {} {}\n".format(
@@ -252,11 +364,13 @@ def make_handler(app):
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
             self.end_headers()
+            self._first_byte_ts = time.monotonic()
             self.wfile.write(body)
 
-        def _send_error_json(self, status, message, err_type="invalid_request_error", code=None):
+        def _send_error_json(self, status, message, err_type="invalid_request_error",
+                             code=None, headers=None):
             self._send_json({"error": {"message": message, "type": err_type, "code": code}},
-                            status)
+                            status, headers=headers)
 
         def _start_stream(self, content_type):
             self.send_response(200)
@@ -267,13 +381,44 @@ def make_handler(app):
             self.end_headers()
             self.close_connection = True
             self._response_started = True
+            self._first_byte_ts = time.monotonic()
+            self._start_keepalive(content_type)
+
+        def _start_keepalive(self, content_type):
+            """Periodic SSE comments keep proxies/clients from timing out on a
+            slow upstream. Only for text/event-stream (NDJSON must stay pure)."""
+            interval = float(getattr(app.config, "sse_keepalive_sec", 0) or 0)
+            if interval <= 0 or "text/event-stream" not in (content_type or ""):
+                return
+            self._stream_stop.clear()
+            thread = threading.Thread(target=self._keepalive_loop, args=(interval,),
+                                      name="sse-keepalive", daemon=True)
+            self._keepalive_thread = thread
+            thread.start()
+
+        def _keepalive_loop(self, interval):
+            while not self._stream_stop.wait(interval):
+                try:
+                    with self._sse_lock:
+                        if self._stream_stop.is_set():
+                            return
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                except OSError:
+                    return
+
+        def _end_stream(self):
+            stop = getattr(self, "_stream_stop", None)
+            if stop is not None:
+                stop.set()
 
         def _sse(self, payload, event=None):
             data = payload if isinstance(payload, str) else json.dumps(
                 payload, separators=(",", ":"))
             chunk = (f"event: {event}\n" if event else "") + f"data: {data}\n\n"
-            self.wfile.write(chunk.encode("utf-8"))
-            self.wfile.flush()
+            with self._sse_lock:
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
 
         def _sse_stream_error(self, exc):
             """In-stream error for clients after headers/role chunk went out."""
@@ -356,12 +501,16 @@ def make_handler(app):
                 self._route_get()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                self._end_stream()
 
         def do_POST(self):
             try:
                 self._route_post()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                self._end_stream()
 
         # ------------------------------------------------ routing
 
@@ -381,6 +530,7 @@ def make_handler(app):
                     "images": (app.image_engine.status()
                                if app.image_engine is not None
                                else "native engine (pip install gemini-webapi for best results)"),
+                    "load": app.load_snapshot(),
                 })
                 return
             if path == "/favicon.ico":
@@ -423,46 +573,135 @@ def make_handler(app):
             except ValueError:
                 self._send_error_json(400, "request body is not valid JSON")
                 return
+            # resolve the route BEFORE taking an upstream slot: unknown routes
+            # (404) must not consume admission capacity or count as failures
+            runner = self._endpoint_runner(path, data)
+            if runner is None:
+                return
+            started = time.monotonic()
+            slot_held = False
+            success = False
+            pressure = None
+            queue_wait_ms = 0.0
             try:
-                if app.queue_wait_sec > 0:
-                    if not app.semaphore.acquire(timeout=app.queue_wait_sec):
+                wait_budget = app.queue_wait_sec
+                waited_at = time.monotonic()
+                if wait_budget > 0:
+                    acquired = app.limiter.acquire(timeout=wait_budget)
+                else:
+                    acquired = app.limiter.acquire()  # legacy: wait indefinitely
+                queue_wait_ms = (time.monotonic() - waited_at) * 1000.0
+                if not acquired:
+                    # fast, honest overload signal: a 429 + Retry-After beats
+                    # parking the request behind a 30s queue (that queue wait is
+                    # exactly what users see as "17s latency")
+                    retry_after = max(1, int(min(10.0, max(wait_budget, 1.0))))
+                    self._send_json(
+                        {"error": {
+                            "message": ("server busy: all upstream slots are in use, "
+                                        "retry after a short pause"),
+                            "type": "rate_limit_error", "code": "server_busy"}},
+                        429, headers={"Retry-After": str(retry_after)})
+                    return
+                slot_held = True
+                try:
+                    lane_busy = False
+                    if app.agents is not None:
+                        # execute the upstream part on a lane-bound agent:
+                        # express jobs never queue behind heavy image/tool work
+                        try:
+                            app.agents.run(
+                                app.lane_for(data, len(raw)), runner, name=path,
+                                timeout=(app.agent_submit_wait_sec or None))
+                        except PoolBusy:
+                            lane_busy = True
+                    else:
+                        runner()
+                    if lane_busy:
+                        # lane queues saturated: same fast, honest overload signal
+                        # as the admission gate (a 429 beats queueing silently)
+                        retry_after = max(1, int(min(
+                            10.0, max(app.agent_submit_wait_sec, 1.0))))
                         self._send_json(
                             {"error": {
-                                "message": ("server busy: all upstream slots in use, "
-                                            "retry after a short pause"),
+                                "message": ("server busy: the agent lanes are "
+                                            "saturated, retry after a short pause"),
                                 "type": "rate_limit_error", "code": "server_busy"}},
-                            429, headers={"Retry-After": str(int(max(app.queue_wait_sec, 1)))})
-                        return
-                else:
-                    app.semaphore.acquire()  # legacy: wait indefinitely
-                try:
-                    if path == "/v1/chat/completions":
-                        self._chat_completions(data)
-                    elif path == "/v1/responses":
-                        self._responses(data)
-                    elif path.startswith("/v1beta/models/") and ":" in path:
-                        model_path, action = path.rsplit(":", 1)
-                        model = model_path.split("/v1beta/models/", 1)[1]
-                        if action == "generateContent":
-                            self._google_generate(data, model, stream=False)
-                        elif action == "streamGenerateContent":
-                            self._google_generate(data, model, stream=True)
-                        else:
-                            self._send_error_json(404, f"unknown action :{action}")
+                            429, headers={"Retry-After": str(retry_after)})
+                    elif self._upstream_error is not None:
+                        # in-band SSE failure: still counts as upstream pressure
+                        pressure = "error"
                     else:
-                        self._send_error_json(404, f"not found: {path}")
-                finally:
-                    app.semaphore.release()
+                        success = True
+                except PromptError:
+                    pressure = None  # client error: no upstream pressure
+                    raise
+                except RateLimitedError:
+                    pressure = "rate_limit"
+                    raise
+                except RetryableError as exc:
+                    pressure = "stall" if exc.kind in ("stall", "timeout") else "error"
+                    raise
+                except (GeminiError, TimeoutError):
+                    pressure = "error"
+                    raise
+                except Exception:
+                    pressure = "error"
+                    raise
             except PromptError as exc:
                 self._fail(400, str(exc))
             except UploadError as exc:
                 self._fail(502, f"image upload failed: {exc}", "upstream_error")
             except RateLimitedError as exc:
-                self._fail(429, str(exc), "upstream_error")
+                headers = {}
+                if getattr(exc, "retry_after", None):
+                    headers["Retry-After"] = str(max(1, int(float(exc.retry_after))))
+                self._fail(429, str(exc), "rate_limit_error", headers=headers)
+            except UpstreamTimeoutError as exc:
+                self._fail(504, str(exc), "timeout_error",
+                           headers={"Retry-After": "1"})
+            except AgentError as exc:
+                # the fleet itself failed (agent died mid-job / pool stopped)
+                self._fail(502, f"agent failure: {exc}", "upstream_error")
             except GeminiError as exc:
                 self._fail(502, str(exc), "upstream_error")
             except Exception as exc:  # noqa: BLE001 - last-resort guard
                 self._fail(500, f"internal error: {exc}", "internal_error")
+            finally:
+                if slot_held:
+                    if success:
+                        app.limiter.release(success=True)
+                    elif pressure:
+                        app.limiter.release(success=False, pressure=pressure)
+                    else:
+                        app.limiter.release(neutral=True)
+                ttfb = getattr(self, "_first_byte_ts", None)
+                app.note_request(
+                    queue_wait_ms=queue_wait_ms,
+                    ttfb_ms=(ttfb - started) * 1000.0 if ttfb else None,
+                    total_ms=(time.monotonic() - started) * 1000.0,
+                    ok=success)
+
+        def _endpoint_runner(self, path, data):
+            """Returns the callable for a POST route (None = route 404 was sent).
+
+            The returned callable is the unit of work an agent lane executes.
+            """
+            if path == "/v1/chat/completions":
+                return lambda: self._chat_completions(data)
+            if path == "/v1/responses":
+                return lambda: self._responses(data)
+            if path.startswith("/v1beta/models/") and ":" in path:
+                model_path, action = path.rsplit(":", 1)
+                model = model_path.split("/v1beta/models/", 1)[1]
+                if action == "generateContent":
+                    return lambda: self._google_generate(data, model, stream=False)
+                if action == "streamGenerateContent":
+                    return lambda: self._google_generate(data, model, stream=True)
+                self._send_error_json(404, f"unknown action :{action}")
+                return None
+            self._send_error_json(404, f"not found: {path}")
+            return None
 
         def _resolve_model_or_error(self, requested):
             """Strict model validation: unknown explicit names -> 400 (config-gated)."""
@@ -482,12 +721,12 @@ def make_handler(app):
                     return resolve_model(name)  # legacy silent fallback
             return resolve_model(name or app.config.default_model)
 
-        def _fail(self, status, message, err_type="invalid_request_error"):
+        def _fail(self, status, message, err_type="invalid_request_error", headers=None):
             if self._response_started:
                 # headers already flushed (SSE) — nothing to do but hang up
                 self.close_connection = True
                 return
-            self._send_error_json(status, message, err_type)
+            self._send_error_json(status, message, err_type, headers=headers)
 
         # ------------------------------------------------ OpenAI chat
 
@@ -570,6 +809,7 @@ def make_handler(app):
                         _emit(event)
                 except GeminiError as exc:
                     # upstream failed after the stream opened — surface in-band
+                    self._upstream_error = exc
                     self._sse_stream_error(exc)
                     return
                 text = "".join(pieces)
@@ -677,6 +917,7 @@ def make_handler(app):
                        {"item_id": msg_id, "output_index": 0, "content_index": 0,
                         "delta": delta, "logprobs": []})
             except GeminiError as exc:
+                self._upstream_error = exc
                 ev("response.failed",
                    {"response": {"id": rid, "object": "response", "status": "failed",
                                  "error": {"message": str(exc),
@@ -810,6 +1051,7 @@ def make_handler(app):
                         pieces.append(delta)
                         emit_delta(delta)
                 except GeminiError as exc:
+                    self._upstream_error = exc
                     emit({"error": {"code": 502, "message": str(exc),
                                     "status": "UPSTREAM_ERROR"}})
                     return
@@ -834,17 +1076,30 @@ def serve(config):
     """Blocking entrypoint: builds the app, starts the HTTP server, serves forever."""
     app = App(config)
     handler = make_handler(app)
-    server = PoolHTTPServer((config.host, config.port), handler,
-                            pool_workers=max(8, int(getattr(config, "pool_workers", 64))))
+    server = PoolHTTPServer(
+        (config.host, config.port), handler,
+        pool_workers=max(8, int(getattr(config, "pool_workers", 128))),
+        queue_depth=max(16, int(getattr(config, "pool_queue_depth", 1024))))
     threading.Thread(target=app.warmup, daemon=True).start()
     threading.Thread(target=app.state_refresher, daemon=True).start()
+    if app.agents is not None:
+        app.agents.start()
 
     auth = "API key" if config.api_keys else "open (no auth)"
     print(f"gemini-web2api v{__version__} listening on http://{config.host}:{config.port}")
     print(f"  endpoints : /v1/chat/completions, /v1/responses, /v1beta/models/*, /v1/models")
     print(f"  reasoning : reasoning_effort=off|low|medium|high|max or model@think=off..max")
+    cookie_wired = bool(getattr(config, "cookie_file", None)
+                        or getattr(config, "cookie_string", None))
     print(f"  default   : {config.default_model} | auth: {auth}"
-          + (" | cookie: yes" if config.cookie_file else " | cookie: no (anonymous)"))
+          + (" | cookie: yes" if cookie_wired else " | cookie: no (anonymous)"))
+    if app.agents is not None:
+        fleet = app.agents.describe()
+        lanes = fleet["lanes"]
+        print(f"  agents    : {fleet['agents']} (express {lanes['express']['agents']}"
+              f" | standard {lanes['standard']['agents']}"
+              f" | heavy {lanes['heavy']['agents']})"
+              f" | lane wait: {config.agent_submit_wait_sec:g}s")
     try:
         # 50ms selector wakeup instead of the 500ms default: a fresh client
         # connection is accepted (and its SSE headers flushed) within a few
@@ -853,4 +1108,6 @@ def serve(config):
     except KeyboardInterrupt:
         pass
     finally:
+        if app.agents is not None:
+            app.agents.stop()
         server.server_close()

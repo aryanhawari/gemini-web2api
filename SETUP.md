@@ -80,6 +80,12 @@ cp config.example.json config.json
 | `request_timeout_sec` | 180 | upstream timeout |
 | `temporary_chats` | false | true = history account me save nahi hogi |
 | `log_requests` | true | request logging (stderr) |
+| `agents_enabled` | true | parallel agent fleet on/off (false = sab inline) |
+| `agents_express` | 6 | ultra-fast lane ke agents (chhoti chat requests) |
+| `agents_standard` | 20 | normal traffic agents |
+| `agents_heavy` | 6 | images / tools / bade payloads ke agents |
+| `agent_queue_depth` | 256 | per-lane queue; bharne par clean 429 + Retry-After |
+| `agent_submit_wait_sec` | 5 | lane slot ke liye max wait (0 = infinite) |
 
 Config search order: `--config` flag → `GEMINI_WEB2API_CONFIG` env →
 `./config.json` → `~/.config/gemini-web2api/config.json`.
@@ -135,7 +141,7 @@ Linux par `network_mode: host`, ya config.json me ek `proxy` set karo.
 ## 7. Tests
 
 ```bash
-python -m unittest discover -s tests     # 53 tests — sab mocked, bina network
+python -m unittest discover -s tests     # 100+ tests — sab mocked, bina network
 ```
 
 ## 8. Troubleshooting

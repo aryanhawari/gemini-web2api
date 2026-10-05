@@ -43,10 +43,14 @@ web2api/
 │   ├── config.py              #   config.json load + defaults + cookie file parsing
 │   ├── models.py              #   model definitions + @think=N parsing
 │   ├── gemini.py              #   ★ CORE: StreamGenerate protocol (payload/URL/headers/parse)
+│   ├── agents.py              #   ★ 10+ parallel agents: lanes + supervisor (express/standard/heavy)
+│   ├── limiter.py             #   AIMD admission gate (adaptive upstream concurrency)
 │   ├── tools.py               #   messages→prompt conversion + tool_call parsing
 │   ├── multimodal.py          #   image upload (Scotty resumable upload)
 │   └── server.py              #   HTTP endpoints (OpenAI + Google native formats)
-├── tests/test_modular_sync.py # 72 unit tests (sab mocked — bina network chalte hain)
+├── tests/test_modular_sync.py # unit tests (sab mocked — bina network chalte hain)
+├── tests/test_latency.py      #   latency/overload regression tests
+├── tests/test_agents.py       #   agent fleet: lanes, supervision, overload
 ├── config.example.json        # config template
 ├── Dockerfile + docker-compose.yml
 └── SETUP.md                   # step-by-step setup guide
@@ -67,9 +71,10 @@ web2api/
 **API key auth** (optional, `api_keys` config): `Authorization: Bearer <key>`,
 `x-api-key:`, `x-goog-api-key:`, ya `?key=` — chaarõ chalte hain. Empty list = no auth.
 
-**Server:** bounded worker-pool `HTTPServer` (64 daemon threads, fixed footprint —
-spike par bhi thread explosion nahi). Chunked transfer-encoding request bodies bhi
-manually parse hoti hain. CORS headers enabled.
+**Server:** bounded worker-pool `HTTPServer` (fixed footprint — spike par bhi
+thread explosion nahi). Chunked transfer-encoding request bodies bhi manually
+parse hoti hain. CORS headers enabled. Har POST request upstream ka kaam
+**lane-scheduled agent fleet** par chalata hai (neeche dekho).
 
 ## Reasoning control (off / low / medium / high / max)
 
@@ -163,9 +168,13 @@ digits `@think=0..4`.
   "log_requests": true,
   "temporary_chats": false,   // true = history account me save nahi hogi
   "state_refresh_sec": 300,   // background BL+xsrf refresh (0 = off)
-  "max_concurrent_requests": 8, // upstream parallel Gemini calls ki limit
-  "queue_wait_sec": 30,       // busy hone par max itna wait, phir 429 (0 = infinite)
-  "pool_workers": 64          // HTTP worker threads (high traffic me badha sakte ho)
+  "max_concurrent_requests": 32, // upstream parallel Gemini calls ki limit (AIMD)
+  "queue_wait_sec": 5,        // busy hone par max itna wait, phir 429 (0 = infinite)
+  "pool_workers": 128,        // HTTP worker threads (high traffic me badha sakte ho)
+  "agents_express": 6,        // ultra-fast lane agents
+  "agents_standard": 20,      // normal traffic agents
+  "agents_heavy": 6,          // images / tools / large payloads
+  "agents_enabled": true      // false = inline (purana behaviour)
 }
 ```
 
@@ -187,6 +196,12 @@ prompt building, tool parsing (OpenAI + Google + raw JSON), Google/Responses
 converters, config + cookie store, aur live HTTP server tests (SSE chunk order,
 chunked bodies, tool_calls, Responses event sequence, 502 on upload failure,
 auth 401, busy-429 overload shedding).
+
+Agent fleet coverage (`tests/test_agents.py`): lane classification (small→express,
+image/tools/large→heavy), 10+ agent default fleet, 6 jobs ka true parallel run,
+express fast-lane saturation test, idle agents ka cross-lane helping, queue-full
+fast `PoolBusy` shedding, supervisor crash-revival (orphan job fail hota hai,
+client hang nahi hota), aur live-server `/health` fleet metrics.
 
 ## Latency & high-traffic engineering
 
@@ -215,6 +230,48 @@ streaming headers+first-chunk ~1ms keep-alive par). Jo isme hai:
 Load-verified: 12 parallel streaming requests, 8 upstream slots — 12/12 success,
 queued requests bhi queue se hi serve hui, koi hang/timeout nahi.
 
+## Agent fleet (10+ parallel agents)
+
+Har POST request ka upstream (Gemini) call ek **agent thread** par execute hota hai.
+Default fleet = **32 agents**, teen lanes me:
+
+| Lane | Default agents | Kya handle karta hai |
+|---|---|---|
+| `express` | 6 | chhoti, image/tool-free chat requests — **ultra fast lane** |
+| `standard` | 20 | baaki normal traffic |
+| `heavy` | 6 | images, tool calls, bade payloads (60KB+) |
+
+- **Reserved capacity** — express lane ke apne agents sirf fast requests ke liye
+  reserved hain; 50 images ka backlog aaye to bhi chhoti chat request apne express
+  agent par turant chalti hai, heavy queue me nahi fasati.
+- **Elastic helping (work stealing)** — apni lane khaali ho to agent doosri lane ki
+  madad karta hai (own lane always first; standard↔heavy spare capacity express ko
+  pehle deti hai). Express agents kabhi heavy kaam nahi uthathe, isliye fast lane
+  ka reservation kabhi khatam nahi hota.
+- **Lane selection** — body bytes `lane_express_chars` (4000) se chhoti + koi image/
+  tool nahi → express; image ya `tools[]` ya body `lane_heavy_chars` (60000) se badi
+  → heavy; warna standard. (Data-URL/`inlineData`/`fileData` dono formats detect hote hain.)
+- **Supervisor (ultra stable)** — agar koi agent thread crash ho jaye, supervisor
+  ~1s me use revive karta hai aur uske mid-flight job ko `AgentError` se fail karta
+  hai (client kabhi hang nahi hota). Crash-loop par exponential backoff.
+- **Bounded lanes** — per-lane queue depth `agent_queue_depth` (256); bharne par
+  request `agent_submit_wait_sec` tak wait karke clean `429` + `Retry-After` deti hai.
+- **Live metrics** — `GET /health` ke `load.agents` me per-lane agents/busy/queued/
+  completed/failed/avg_job_ms, total restarts aur last error dikhte hain.
+
+```json
+{
+  "agents_enabled": true,      // false = sab inline (purana behaviour)
+  "agents_express": 6,         // ultra-fast lane agents
+  "agents_standard": 20,       // normal traffic agents
+  "agents_heavy": 6,           // images/tools/large payloads
+  "agent_queue_depth": 256,    // per-lane queue; bharne par 429
+  "agent_submit_wait_sec": 5,  // lane slot ke liye max wait (0 = infinite)
+  "lane_express_chars": 4000,  // is se chhoti body = express lane
+  "lane_heavy_chars": 60000    // is se badi body = heavy lane
+}
+```
+
 ## Deployment
 
 **Local:** `pip install -r requirements.txt && python -m gemini_web2api`
@@ -239,7 +296,9 @@ Docker Desktop par Gemini NAT IP ranges reject kar sakta hai → Linux par
 
 Supported env vars: `PROXY_API_KEY`, `PROXY_API_KEYS` (comma list), `COOKIE_STRING`,
 `RETRY_ATTEMPTS`, `REQUEST_TIMEOUT_SEC`, `MAX_CONCURRENT_REQUESTS`, `MAX_BODY_MB`,
-`STATE_REFRESH_SEC`, `POOL_WORKERS`, `QUEUE_WAIT_SEC`, `PORT`.
+`STATE_REFRESH_SEC`, `POOL_WORKERS`, `QUEUE_WAIT_SEC`, `AGENTS_ENABLED`,
+`AGENTS_EXPRESS`, `AGENTS_STANDARD`, `AGENTS_HEAVY`, `AGENT_QUEUE_DEPTH`,
+`AGENT_SUBMIT_WAIT_SEC`, `LANE_EXPRESS_CHARS`, `LANE_HEAVY_CHARS`, `PORT`.
 **Note:** `.env`/cookie.txt GitHub me nahi hain (gitignored) — Railway par values
 Variables se aati hain. Binna cookie Railway par anonymous Flash models chalenge
 (rate-limited); `COOKIE_STRING` doge to images + stable quota bhi.

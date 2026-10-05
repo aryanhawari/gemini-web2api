@@ -8,6 +8,7 @@ build-label (405) and xsrf (400) recovery, and bounded retries with backoff.
 
 import hashlib
 import json
+import queue
 import random
 import re
 import threading
@@ -75,6 +76,30 @@ class RateLimitedError(GeminiError):
     def __init__(self, message, retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class UpstreamTimeoutError(GeminiError):
+    """A local deadline / first-byte guard tripped before usable output."""
+
+
+def transport_error(exc, phase="request"):
+    """Wraps a socket/httpx failure in the retryable Gemini error type.
+
+    Transport failures must never escape as generic 500s: they are retryable
+    (or deadline-fatal) and the admission gate must see them as pressure.
+    """
+    if isinstance(exc, TimeoutError):
+        return RetryableError(f"upstream timeout during {phase}", kind="stall")
+    if HAVE_HTTPX:
+        try:
+            if isinstance(exc, httpx.TimeoutException):
+                return RetryableError(f"upstream timeout during {phase}", kind="stall")
+            if isinstance(exc, httpx.TransportError):
+                return RetryableError(
+                    f"upstream transport error during {phase}: {exc}", kind="timeout")
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return RetryableError(f"upstream I/O error during {phase}: {exc}", kind="timeout")
 
 
 def _header(headers, name):
@@ -353,6 +378,9 @@ class GeminiClient:
         self._xsrf_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._xsrf = config.xsrf_token
+        self.limiter = None  # optional AdaptiveConcurrency injected by server.App
+        self._hedge_slots = threading.BoundedSemaphore(
+            max(1, int(getattr(config, "hedge_max_inflight", 2) or 2)))
 
     # -- low-level HTTP ----------------------------------------------------
 
@@ -394,8 +422,12 @@ class GeminiClient:
                 follow_redirects=True,
                 http2=HAVE_H2,
                 limits=httpx.Limits(
-                    max_connections=HTTP_MAX_CONNECTIONS,
-                    max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+                    max_connections=max(
+                        HTTP_MAX_CONNECTIONS,
+                        int(getattr(self.cfg, "max_concurrent_requests", 8) or 8) * 2),
+                    max_keepalive_connections=max(
+                        HTTP_MAX_KEEPALIVE,
+                        int(getattr(self.cfg, "max_concurrent_requests", 8) or 8)),
                     keepalive_expiry=KEEPALIVE_EXPIRY_SEC),
                 headers={"User-Agent": DEFAULT_USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
             )
@@ -550,7 +582,10 @@ class GeminiClient:
         """Same request via the curl_cffi session (Chrome TLS fingerprint)."""
         url = self.build_url()
         body = self.build_body(inner)
-        resp = self._curl().post(url, data=body, headers=self._post_headers())
+        try:
+            resp = self._curl().post(url, data=body, headers=self._post_headers())
+        except Exception as exc:
+            raise transport_error(exc, "request") from exc
         self._raise_for_status(resp.status_code, resp.text[:300],
                                dict(resp.headers.items()))
         return resp.text
@@ -571,7 +606,11 @@ class GeminiClient:
         headers = self._post_headers()
         http = self._http()
         if http is not None:
-            resp = http.post(url, content=body, headers=headers)
+            try:
+                resp = http.post(url, content=body, headers=headers,
+                                 timeout=self._timeout(self.cfg.request_timeout_sec))
+            except Exception as exc:
+                raise transport_error(exc, "request") from exc
             self._raise_for_status(resp.status_code, resp.text[:300], resp.headers)
             return resp.text
         try:
@@ -581,14 +620,49 @@ class GeminiClient:
             self._raise_for_status(exc.code, snippet, dict(exc.headers))
             raise
 
-    def _post_stream_once(self, inner):
-        """Generator of raw response lines (requires httpx)."""
+    def _post_stream_once(self, inner, cancel_event=None, response_box=None,
+                          timeout=None):
+        """Generator of raw response lines (requires httpx).
+
+        ``cancel_event`` lets a racing consumer abandon this attempt, and
+        ``response_box`` receives the open response object so the consumer can
+        close the socket from another thread and unblock a stuck read.
+        """
         url = self.build_url()
         body = self.build_body(inner)
         headers = self._post_headers()
-        with self._http().stream("POST", url, content=body, headers=headers) as resp:
-            self._raise_for_status(resp.status_code, "", resp.headers)
-            for raw in resp.iter_lines():
+        http = self._http()
+        if http is None:
+            raise GeminiError("httpx is required for streamed responses")
+        try:
+            ctx = http.stream("POST", url, content=body, headers=headers,
+                              timeout=timeout if timeout is not None else self._timeout())
+        except Exception as exc:
+            raise transport_error(exc, "connect") from exc
+        with ctx as resp:
+            if response_box is not None:
+                response_box.append(resp)
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if resp.status_code != 200:
+                snippet = ""
+                try:
+                    snippet = resp.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    pass
+                self._raise_for_status(resp.status_code, snippet, resp.headers)
+            iterator = resp.iter_lines()
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                try:
+                    raw = next(iterator)
+                except StopIteration:
+                    return
+                except Exception as exc:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    raise transport_error(exc, "stream") from exc
                 if raw:
                     yield raw
 
@@ -607,6 +681,8 @@ class GeminiClient:
             return random.uniform(0, 0.15)
         if kind == "empty":
             return 0.25 * (attempt + 1) + random.uniform(0, 0.1)
+        if kind in ("stall", "timeout"):
+            return 0.2 * (attempt + 1) + random.uniform(0, 0.1)
         return min(self.cfg.retry_delay_sec * (2 ** attempt), 8.0) + random.uniform(0, 0.25)
 
     def _recover(self, exc):
@@ -621,12 +697,242 @@ class GeminiClient:
             except GeminiError:
                 pass
 
+    # -- latency guards / tail hedging ---------------------------------------
+
+    def _deadline(self):
+        budget = float(getattr(self.cfg, "request_deadline_sec", 0) or 0)
+        return (time.monotonic() + budget) if budget > 0 else None
+
+    def _remaining(self, deadline):
+        return None if deadline is None else deadline - time.monotonic()
+
+    def _check_deadline(self, deadline, phase):
+        remaining = self._remaining(deadline)
+        if remaining is not None and remaining <= 0:
+            raise UpstreamTimeoutError(
+                f"upstream {phase} exceeded the "
+                f"{float(self.cfg.request_deadline_sec):g}s request deadline")
+        return remaining
+
+    def _timeout(self, read=None):
+        """Per-request httpx timeout; split so a dead upstream fails fast."""
+        base = float(self.cfg.request_timeout_sec)
+        read = base if read is None else max(1.0, min(float(read), base))
+        return httpx.Timeout(connect=min(10.0, base), read=read, write=30.0,
+                             pool=8.0)
+
+    def _stream_timeout(self, deadline=None):
+        read = float(getattr(self.cfg, "stream_read_timeout_sec", 0) or 0)
+        if read <= 0:
+            read = float(self.cfg.request_timeout_sec)
+        remaining = self._remaining(deadline)
+        if remaining is not None:
+            read = min(read, max(1.0, remaining))
+        return self._timeout(read)
+
+    def _sleep_before_retry(self, attempt, exc, deadline):
+        """Bounded, deadline-aware backoff.
+
+        A long upstream Retry-After is never slept on while a client waits and
+        an upstream slot stays pinned -- the 429 is surfaced immediately with
+        its Retry-After header instead of becoming a hidden multi-minute hang.
+        """
+        cap = float(getattr(self.cfg, "max_retry_wait_sec", 3.0) or 0)
+        if isinstance(exc, RateLimitedError) and exc.retry_after:
+            if cap > 0 and exc.retry_after > cap:
+                raise exc
+        delay = self._backoff(attempt, exc)
+        if cap > 0:
+            delay = min(delay, cap)
+        remaining = self._remaining(deadline)
+        if remaining is not None:
+            if remaining <= 0.05:
+                raise UpstreamTimeoutError(
+                    "request deadline reached before the next upstream attempt")
+            delay = min(delay, max(0.0, remaining - 0.05))
+        if delay > 0:
+            time.sleep(delay)
+
+    def _hedged_lines(self, inner, deadline=None):
+        """Yields raw upstream lines, racing a second attempt on a stalled start.
+
+        The primary attempt starts immediately. If it stays silent longer than
+        ``hedge_after_sec`` (and the admission gate has a spare permit), a
+        second attempt starts too; whichever produces a line first wins and
+        the loser is cancelled and closed. Healthy requests never pay for a
+        second call, and under saturation the gate refuses the extra permit,
+        so hedging can never amplify load during a traffic spike.
+        """
+        hedge_after = float(getattr(self.cfg, "hedge_after_sec", 0) or 0)
+        first_byte_timeout = float(
+            getattr(self.cfg, "first_byte_timeout_sec", 0) or 0)
+        limiter = getattr(self, "limiter", None)
+        local_slots = self._hedge_slots
+        hedge_enabled = hedge_after > 0
+        first_byte_deadline = (time.monotonic() + first_byte_timeout
+                               if first_byte_timeout > 0 else None)
+        events = queue.Queue()
+        attempts = {}
+        alive = set()
+        finished = set()
+        errors = {}
+
+        def pump(tag, gate_permit, local_permit):
+            state = attempts[tag]
+            cancel = state["cancel"]
+            box = state["box"]
+            error = None
+            try:
+                for raw in self._post_stream_once(
+                        inner, cancel_event=cancel, response_box=box,
+                        timeout=self._stream_timeout(deadline)):
+                    if cancel.is_set():
+                        break
+                    events.put((tag, "line", raw))
+            except BaseException as exc:  # noqa: BLE001 - forwarded to consumer
+                if not cancel.is_set():
+                    error = exc
+            finally:
+                if local_permit:
+                    try:
+                        local_slots.release()
+                    except Exception:
+                        pass
+                if gate_permit and limiter is not None:
+                    try:
+                        limiter.release(neutral=True)
+                    except TypeError:  # plain semaphore injected by a caller
+                        limiter.release()
+                    except Exception:
+                        pass
+                events.put((tag, "end", error))
+
+        def start(tag):
+            if tag in attempts:
+                return False
+            gate_permit = False
+            local_permit = False
+            if tag != "primary":
+                if not local_slots.acquire(blocking=False):
+                    return False
+                local_permit = True
+                if limiter is not None:
+                    try:
+                        got = limiter.acquire(timeout=0, count_shed=False)
+                    except TypeError:  # plain semaphore injected by a caller
+                        got = limiter.acquire(blocking=False)
+                    if not got:
+                        local_slots.release()
+                        return False
+                    gate_permit = True
+            attempts[tag] = {"cancel": threading.Event(), "box": []}
+            thread = threading.Thread(target=pump, args=(tag, gate_permit, local_permit),
+                                      name="gemini-stream-" + tag, daemon=True)
+            try:
+                thread.start()
+            except Exception:
+                attempts.pop(tag, None)
+                if local_permit:
+                    local_slots.release()
+                if gate_permit and limiter is not None:
+                    limiter.release(neutral=True)
+                return False
+            alive.add(tag)
+            return True
+
+        if not start("primary"):
+            raise GeminiError("could not start the upstream request")
+
+        hedge_at = (time.monotonic() + hedge_after) if hedge_enabled else None
+        hedge_attempted = False
+        winner = None
+        first_line = None
+        try:
+            while winner is None:
+                now = time.monotonic()
+                if hedge_at is not None and not hedge_attempted and now >= hedge_at:
+                    hedge_attempted = True
+                    start("hedge")
+                wait = None
+                if first_byte_deadline is not None:
+                    wait = first_byte_deadline - now
+                if hedge_at is not None and not hedge_attempted:
+                    hedge_wait = hedge_at - now
+                    wait = hedge_wait if wait is None else min(wait, hedge_wait)
+                if wait is not None and wait <= 0:
+                    if (first_byte_deadline is not None
+                            and now >= first_byte_deadline):
+                        raise RetryableError(
+                            f"upstream produced no data within "
+                            f"{first_byte_timeout:g}s", kind="stall")
+                    continue
+                try:
+                    item = events.get(timeout=wait)
+                except queue.Empty:
+                    continue
+                tag, kind, payload = item
+                if kind == "line":
+                    winner = tag
+                    first_line = payload
+                    break
+                if tag in finished:
+                    continue
+                finished.add(tag)
+                alive.discard(tag)
+                if payload is not None:
+                    errors[tag] = payload
+                if not alive and hedge_at is not None and not hedge_attempted:
+                    # the primary died before the hedge timer: do not wait it out
+                    hedge_attempted = True
+                    if start("hedge"):
+                        continue
+                if not alive:
+                    if errors:
+                        raise errors[next(reversed(errors))]
+                    raise RetryableError("Gemini returned an empty stream.",
+                                         kind="empty")
+
+            for tag, state in attempts.items():
+                if tag != winner:
+                    state["cancel"].set()
+                    box = state["box"]
+                    if box:
+                        try:
+                            box[0].close()
+                        except Exception:
+                            pass
+            if first_line is not None:
+                yield first_line
+            while True:
+                tag, kind, payload = events.get()
+                if kind == "line":
+                    if tag == winner:
+                        yield payload
+                    continue
+                if tag in finished:
+                    continue
+                finished.add(tag)
+                if tag == winner:
+                    if payload is not None:
+                        raise payload
+                    return
+        finally:
+            for state in attempts.values():
+                state["cancel"].set()
+                box = state["box"]
+                if box:
+                    try:
+                        box[0].close()
+                    except Exception:
+                        pass
+
     def generate(self, prompt, file_refs=None, model_info=None):
         """Blocking generation with bounded retries. Returns the final text."""
         self._prepare_xsrf()
         use_curl = self._use_curl_for_files(file_refs)
         inner = build_inner(prompt, file_refs or [], model_info,
                             temporary_chats=self.cfg.temporary_chats)
+        deadline = self._deadline()
         last = None
         attempts = max(1, self.cfg.retry_attempts)
         for attempt in range(attempts):
@@ -643,7 +949,7 @@ class GeminiClient:
                 last = exc
                 self._recover(exc)
                 if attempt < attempts - 1:
-                    time.sleep(self._backoff(attempt, last))
+                    self._sleep_before_retry(attempt, last, deadline)
         raise last
 
     def stream_events(self, prompt, file_refs=None, model_info=None):
@@ -651,7 +957,9 @@ class GeminiClient:
 
         Retries only before the first text delta; thought-only progress does
         not block a retry (a repeated thinking trace is cosmetic, an empty
-        answer is not).
+        answer is not). All attempts share one overall deadline, and a silent
+        start is hedged, so a single slow upstream connection can no longer
+        stretch the client-visible latency.
         """
         if self._http() is None:  # no httpx -> non-streaming fallback
             yield ("text", self.generate(prompt, file_refs, model_info))
@@ -664,14 +972,17 @@ class GeminiClient:
         self._prepare_xsrf()
         inner = build_inner(prompt, file_refs or [], model_info,
                             temporary_chats=self.cfg.temporary_chats)
+        deadline = self._deadline()
         last = None
         attempts = max(1, self.cfg.retry_attempts)
         for attempt in range(attempts):
             text_emitted = False
             try:
-                for kind, delta in iter_events(self._post_stream_once(inner)):
+                for kind, delta in iter_events(self._hedged_lines(inner, deadline)):
                     if kind == "text":
                         text_emitted = True
+                    else:
+                        self._check_deadline(deadline, "stream")
                     yield kind, delta
                 if not text_emitted:
                     raise RetryableError("Gemini returned an empty stream.", kind="empty")
@@ -682,7 +993,7 @@ class GeminiClient:
                     raise
                 self._recover(exc)
                 if attempt < attempts - 1:
-                    time.sleep(self._backoff(attempt, last))
+                    self._sleep_before_retry(attempt, last, deadline)
         raise last
 
     def stream_generate(self, prompt, file_refs=None, model_info=None):
